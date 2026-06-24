@@ -1,0 +1,33 @@
+services:
+  aimilivpn:
+    build: .
+    # 不固定 container_name：compose 会按项目名自动生成容器名，
+    # 这样一台机器可同时启动多个实例；否则同名容器会冲突。
+    restart: unless-stopped
+
+    # OpenVPN TUN 适配器的硬性要求 —— 缺这两项会报
+    # ERR_OVPN_TUN_NOT_AVAILABLE / "Cannot allocate tun"。
+    # 多个容器可共享同一个 /dev/net/tun：各自网络命名空间内
+    # 会创建独立的 tun0，互不干扰。
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+
+    # 网页后台(8787) 与 HTTP/SOCKS5 出站代理(7928)。
+    # 端口变量化：一台机器跑多实例时，每个实例用不同的“主机端口”
+    # 避免冲突(见 .env.example)；容器内端口不变，靠主机侧区分。
+    ports:
+      - "${WEB_PORT:-8787}:8787"
+      - "${PROXY_PORT:-7928}:7928"
+
+    environment:
+      # 节点列表/状态/日志/认证持久化到挂载卷。
+      VPNGATE_DATA_DIR: /data
+      # 代理默认只绑 127.0.0.1，发布的主机端口会连不上；绑 0.0.0.0
+      # 才让端口映射生效。若仅容器间使用、不需对外暴露代理，可改回
+      # 127.0.0.1 并删掉上面的 7928 端口映射(更安全)。
+      LOCAL_PROXY_HOST: "0.0.0.0"
+
+    volumes:
+      - "${DATA_DIR:-./data}:/data"

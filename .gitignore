@@ -25,10 +25,16 @@ build/
 
 # ---- 运行时数据 ----
 vpngate_data/
+data/
 logs/
 *.log
 *.tmp
 *.pid
+
+# ---- 环境变量(每个实例的本地端口/数据目录配置) ----
+# 保留 .env.example 作为模板，但不提交实际的 .env
+.env
+.env.local
 
 # ---- IDE 和编辑器 ----
 .vscode/

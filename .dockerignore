@@ -1,0 +1,34 @@
+# Exclude non-build files from the Docker context to speed up transfers.
+# The Dockerfile COPYs ONLY: proxy_server.py, vpn_utils.py, vpngate_manager.py
+# — those three MUST stay reachable. Do NOT list them here.
+
+# VCS / IDE
+.git
+.gitignore
+.idea
+.vscode
+
+# Docs & host-only install helpers (not needed inside the container)
+README.md
+LICENSE
+install.sh
+*.md
+
+# Runtime data (persisted via the ./data volume instead)
+data/
+vpngate_data/
+logs/
+
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
+
+# Temp / system
+*.log
+*.tmp
+*.pid
+*.bak
+*.orig
+.DS_Store
+Thumbs.db
