@@ -19,15 +19,15 @@
 </div>
 
 <a id="vps"></a>
+
 ## 服务商推荐
 
 | 商家 | 推荐理由 | 入口 |
 | --- | --- | --- |
-| **BandwagonHost** | 电信 CN2 GIA、联通 9929、移动 CMIN2 三网优化线路；低延迟、高稳定性，适合 TikTok 直播、海外带货和长期出海业务。 | [立即查看](https://bandwagonhost.com/aff.php?aff=81790) |
-| **RackNerd** | 每月 4000GB 大流量，价格与配置性价比突出；部署成本低，适合需要长期稳定运行的服务。 | [立即查看](https://my.racknerd.com/aff.php?aff=18708) |
-| **OpenMili** | OpenMili Ai 中转站 5.6 Sol & Images 2.0 Pro美区原价 0.12倍率 不掺假、不降智，接受压力测试！| [立即查看](https://openmili.com/) |
-
-部分链接为推广链接，通过这些链接购买不会增加你的费用。
+| **Bandwagon** |代理 & 建站推荐：CN2/9929/CMI三网直连 2500 Mbps 高速线路；低延迟、高稳定性，适合直播、带货和长期出海业务。 | [立即查看](https://bandwagonhost.com/aff.php?aff=81790) |
+| **RackNerd** | 综合服务器推荐：4000GB 大流量，价格与配置性价比突出；部署成本低，适合需要长期稳定运行的服务。 | [立即查看](https://my.racknerd.com/aff.php?aff=18708) |
+| **OpenMili** | OpenMili Ai 中转站推荐：GPT-6 Astra & Images 2.0 Pro 美区原价 0.12倍率 不掺假、不降智，接受任何压力测试！| [立即查看](https://openmili.com/) |
+| **JTTI VPS** | 稳定建站服务器推荐：5 Mbps 独享带宽 无限流量 CN2/9929/CMI三网直连，跨境网站访问低延迟，长期稳定API运营。| [立即查看](https://www.jtti.cc/zh/activity/y2026-national-day.html?k=baoweise) |
 
 AimiliVPN 使用 Python 标准库管理 VPNGate 节点，提供节点获取与检测、连接切换、Web 管理后台，以及共用一个端口的 HTTP、HTTPS 网站代理和 SOCKS5 代理服务。
 
