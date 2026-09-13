@@ -15,16 +15,31 @@ fi
 
 # 2. Check OS distribution and set package manager
 OS_TYPE=""
+OS_LIKE=""
 PKG_MGR=""
 if [ -f /etc/os-release ]; then
     . /etc/os-release
-    OS_TYPE=$ID
+    OS_TYPE=${ID:-}
+    OS_LIKE=${ID_LIKE:-}
 fi
 
 case "$OS_TYPE" in
-    ubuntu|debian)
+    ubuntu|debian|elementary)
         PKG_MGR="apt-get"
         export DEBIAN_FRONTEND=noninteractive
+        ;;
+    *)
+        case " $OS_LIKE " in
+            *" ubuntu "*|*" debian "*)
+                PKG_MGR="apt-get"
+                export DEBIAN_FRONTEND=noninteractive
+                ;;
+        esac
+        ;;
+esac
+
+case "$OS_TYPE" in
+    ubuntu|debian|elementary)
         ;;
     alpine)
         PKG_MGR="apk"
@@ -37,8 +52,10 @@ case "$OS_TYPE" in
         fi
         ;;
     *)
-        echo -e "${RED}错误: 不支持的操作系统 ($OS_TYPE)！目前仅支持 Ubuntu/Debian/Alpine/CentOS/RHEL/Rocky/AlmaLinux/Fedora/OracleLinux/AmazonLinux。${PLAIN}"
-        exit 1
+        if [ -z "$PKG_MGR" ]; then
+            echo -e "${RED}错误: 不支持的操作系统 ($OS_TYPE)！目前仅支持 Ubuntu/Debian/Alpine/CentOS/RHEL/Rocky/AlmaLinux/Fedora/OracleLinux/AmazonLinux 及其兼容发行版。${PLAIN}"
+            exit 1
+        fi
         ;;
 esac
 
