@@ -184,6 +184,9 @@ Use its `secret_path`, `username`, and `password`, then change them after the fi
 4. Choose Smart Auto, Fixed Country, or Fixed IP routing.
 5. Confirm the VPN state and outbound IP in the status area.
 
+> [!NOTE]
+> **Automatic Russia node filtering:** after a successful probe, the node's physical location is resolved from its IP; a node located in Russia is automatically marked unavailable and excluded from Smart Auto, fast-connect, and periodic checks. Its location is still shown in the node list for transparency.
+
 ### 3. Use the proxy on the VPS
 
 HTTP, HTTPS website proxying, and SOCKS5 share `127.0.0.1:7928`. HTTPS sites use the HTTP proxy's `CONNECT` method, so the proxy URL remains `http://127.0.0.1:7928`.
