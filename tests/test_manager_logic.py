@@ -857,6 +857,13 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertNotIn("origin/master", install_text)
         self.assertNotIn("bate", install_text.lower())
 
+    def test_installer_accepts_elementary_and_debian_derivatives(self) -> None:
+        install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
+
+        self.assertIn("OS_LIKE=${ID_LIKE:-}", install_text)
+        self.assertIn("ubuntu|debian|elementary)", install_text)
+        self.assertIn('*" ubuntu "*|*" debian "*)', install_text)
+
     def test_installer_uses_secure_credentials_and_current_version(self) -> None:
         install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
 
