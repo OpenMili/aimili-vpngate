@@ -397,6 +397,10 @@ def save_ip_cache(cache: dict[str, dict[str, Any]]) -> None:
         except Exception:
             pass
 
+def location_is_russia(location: Any) -> bool:
+    text = str(location or "")
+    return "俄罗斯" in text or "Russia" in text
+
 def classify_ip_type(item: dict[str, Any]) -> tuple[str, str]:
     """Classify network ownership without confusing VPN use with hosting."""
     if item.get("mobile"):
