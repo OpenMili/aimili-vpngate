@@ -17,7 +17,7 @@ services:
     environment:
       DEPLOYMENT_MODE: docker
       VPNGATE_DATA_DIR: /data
-      UI_HOST: "0.0.0.0"
+      UI_HOST: "127.0.0.1"
       UI_PORT: "8787"
       LOCAL_PROXY_HOST: "127.0.0.1"
       LOCAL_PROXY_PORT: "7928"

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import base64
+import ipaddress
 import os
 import secrets
 import select
@@ -50,11 +51,13 @@ def parse_host_port(authority: str, default_port: int) -> tuple[str, int]:
     return authority, default_port
 
 def get_proxy_credentials() -> tuple[str | None, str | None]:
-    user = os.environ.get("LOCAL_PROXY_USER") or os.environ.get("LOCAL_PROXY_USERNAME")
-    password = os.environ.get("LOCAL_PROXY_PASS") or os.environ.get("LOCAL_PROXY_PASSWORD")
+    user = os.environ.get("LOCAL_PROXY_USER", os.environ.get("LOCAL_PROXY_USERNAME"))
+    password = os.environ.get("LOCAL_PROXY_PASS", os.environ.get("LOCAL_PROXY_PASSWORD"))
     if user is None and password is None:
         return None, None
-    return user or "", password or ""
+    if not user or not password:
+        raise ValueError("代理用户名和密码必须同时配置且不能为空")
+    return user, password
 
 def proxy_auth_enabled() -> bool:
     user, password = get_proxy_credentials()
@@ -180,25 +183,23 @@ def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) 
 
 def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
     try:
-        socket.inet_aton(host)
-        return host
-    except OSError:
-        pass
-    try:
-        socket.inet_pton(socket.AF_INET6, host)
-        return host
-    except OSError:
+        return str(ipaddress.ip_address(host))
+    except ValueError:
         pass
     return dns_query_over_tun0(host, 1, dns_server, timeout) or dns_query_over_tun0(host, 28, dns_server, timeout)
 
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
     host, port = address
     resolved_ip = resolve_dns_over_tun0(host)
-    if resolved_ip:
-        host = resolved_ip
+    if not resolved_ip:
+        raise socket.gaierror(socket.EAI_AGAIN, "VPN 隧道 DNS 解析失败，已拒绝系统 DNS 回退")
+    try:
+        host = str(ipaddress.ip_address(resolved_ip))
+    except ValueError as exc:
+        raise socket.gaierror(socket.EAI_FAIL, "VPN DNS 返回的地址无效") from exc
 
     err = None
-    for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+    for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM, flags=socket.AI_NUMERICHOST):
         af, socktype, proto, canonname, sa = res
         sock = None
         try:
@@ -396,6 +397,7 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
             pass
 
 def start_proxy_server(host: str, port: int) -> None:
+    get_proxy_credentials()  # Reject incomplete credentials before opening a listener.
     is_ipv6 = ":" in host or host == ""
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
     server = None

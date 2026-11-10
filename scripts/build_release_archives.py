@@ -19,8 +19,13 @@ RELEASE_FILES = [
     "vpn_utils.py",
     "proxy_server.py",
     "snapshot_utils.py",
+    "manual_target.py",
+    "proxyctl.py",
+    "official_web.py",
     "Dockerfile",
     "compose.yaml",
+    "compose.manual.yaml",
+    "docs/MANUAL_PROXY_ZH.md",
 ]
 
 
@@ -57,6 +62,7 @@ def build_archive(root: Path, output_dir: Path) -> Path:
         package_root.mkdir()
 
         for name in RELEASE_FILES:
+            (package_root / name).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(root / name, package_root / name)
         shutil.copytree(root / "mirror", package_root / "mirror")
 

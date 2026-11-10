@@ -12,6 +12,7 @@ LABEL org.opencontainers.image.title="AimiliVPN" \
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         ca-certificates \
+        curl \
         iproute2 \
         iptables \
         openvpn \
@@ -22,20 +23,20 @@ RUN apt-get update \
 
 WORKDIR /app
 COPY VERSION README.md LICENSE ./
-COPY vpngate_manager.py vpn_utils.py proxy_server.py snapshot_utils.py ./
+COPY vpngate_manager.py vpn_utils.py proxy_server.py snapshot_utils.py manual_target.py proxyctl.py official_web.py ./
 COPY mirror ./mirror
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     DEPLOYMENT_MODE=docker \
     VPNGATE_DATA_DIR=/data \
-    UI_HOST=0.0.0.0 \
+    UI_HOST=127.0.0.1 \
     UI_PORT=8787 \
     LOCAL_PROXY_HOST=127.0.0.1 \
     LOCAL_PROXY_PORT=7928
 
 RUN mkdir -p /data \
-    && python3 -m py_compile vpngate_manager.py vpn_utils.py proxy_server.py snapshot_utils.py
+    && python3 -m py_compile vpngate_manager.py vpn_utils.py proxy_server.py snapshot_utils.py manual_target.py proxyctl.py official_web.py
 
 VOLUME ["/data"]
 EXPOSE 8787/tcp 7928/tcp

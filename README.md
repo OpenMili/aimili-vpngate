@@ -2,6 +2,9 @@
 
 # AimiliVPN
 
+> 支持**按 IP 或多个国家手动切换出口**：可同时选择美国、加拿大等国家，失效时仅在所选范围内切换。提供 Web 表单、选择 API 和 `proxyctl.py`，CSV 节点源不可用时可回退到官方 HTTPS 网页。
+> 使用方法及兼容性说明见 [手动代理操作说明](docs/MANUAL_PROXY_ZH.md)。通过 `compose.manual.yaml` 可从当前源码构建测试；已发布的旧镜像不包含这些新增功能。
+
 **面向 Linux VPS 的 VPNGate 节点管理与 HTTP / HTTPS / SOCKS5 代理网关**
 
 [![正式版本](https://img.shields.io/github/v/release/baoweise-bot/aimili-vpngate?style=flat-square&label=正式版&color=16a34a)](https://github.com/baoweise-bot/aimili-vpngate/releases/latest)

@@ -4,6 +4,7 @@ from __future__ import annotations
 import base64
 import csv
 import json
+import ipaddress
 import os
 import queue
 import re
@@ -61,6 +62,8 @@ class DualStackHTTPServer(ThreadingHTTPServer):
 import vpn_utils
 import proxy_server
 import snapshot_utils
+import manual_target
+import official_web
 
 def env_int(name: str, default: int, min_value: int | None = None, max_value: int | None = None) -> int:
     raw = os.environ.get(name)
@@ -110,6 +113,8 @@ MIRROR_META_URL = os.environ.get(
 ).strip()
 # Kept as the primary URL for diagnostics and backwards-compatible state output.
 API_URL = API_HTTPS_URL
+ALLOW_INSECURE_NODE_SOURCES = os.environ.get("ALLOW_INSECURE_NODE_SOURCES", "0") == "1"
+WEB_FALLBACK_ENABLED = os.environ.get("VPNGATE_WEB_FALLBACK", "1") == "1"
 FETCH_INTERVAL_SECONDS = env_int("FETCH_INTERVAL_SECONDS", 1260, 1)
 CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
 TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
@@ -127,7 +132,7 @@ OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
 LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "127.0.0.1")
 LOCAL_PROXY_PORT = env_int("LOCAL_PROXY_PORT", 7928, 1, 65535)
-UI_HOST = os.environ.get("UI_HOST", "::")
+UI_HOST = os.environ.get("UI_HOST", "127.0.0.1")
 UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 DEPLOYMENT_MODE = os.environ.get("DEPLOYMENT_MODE", "source").strip().lower()
@@ -317,13 +322,14 @@ def load_ui_config() -> dict[str, Any]:
         auth_file = DATA_DIR / "ui_auth.json"
         config = {
             "username": "",
-            "secret_path": "EJsW2EeBo9lY",
+            "secret_path": secrets.token_hex(16),
             "password": "",
             "host": UI_HOST,
             "port": UI_PORT,
             "proxy_port": LOCAL_PROXY_PORT,
             "routing_mode": "auto",
             "force_country": "",
+            "force_countries": [],
             "routing_ip_type": "all",
             "connection_enabled": True,
             "fixed_node_id": "",
@@ -341,7 +347,7 @@ def load_ui_config() -> dict[str, Any]:
                 data = json.loads(auth_file.read_text(encoding="utf-8"))
                 for key, val in data.items():
                     config[key] = val
-                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "discovery_countries"]:
+                for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "force_countries", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "discovery_countries"]:
                     if key not in data:
                         updated = True
             except Exception:
@@ -526,6 +532,7 @@ def get_state() -> dict[str, Any]:
     state["proxy_port"] = ui_cfg.get("proxy_port", 7928)
     state["routing_mode"] = ui_cfg.get("routing_mode", "auto")
     state["force_country"] = ui_cfg.get("force_country", "")
+    state["force_countries"] = manual_target.routing_countries(ui_cfg)
     state["routing_ip_type"] = ui_cfg.get("routing_ip_type", "all")
     state["connection_enabled"] = ui_cfg.get("connection_enabled", True)
     state["fixed_node_id"] = ui_cfg.get("fixed_node_id", "")
@@ -816,14 +823,20 @@ def fetch_api_text(url: str | None = None, use_ssl_verify: bool = True) -> str:
             chunks.append(chunk)
         return b"".join(chunks)
 
+    class SafeRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, req, fp, code, msg, headers, newurl):
+            if urllib.parse.urlsplit(newurl).scheme != "https":
+                raise ValueError("拒绝节点源/更新检查降级到非 HTTPS 地址")
+            return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+    handlers = [SafeRedirect()]
     if url.startswith("https://") and not use_ssl_verify:
         import ssl
         ctx = ssl._create_unverified_context()
-        with urllib.request.urlopen(request, timeout=API_FETCH_TIMEOUT_SECONDS, context=ctx) as response:
-            return read_limited(response).decode("utf-8", errors="replace")
-    else:
-        with urllib.request.urlopen(request, timeout=API_FETCH_TIMEOUT_SECONDS) as response:
-            return read_limited(response).decode("utf-8", errors="replace")
+        handlers.append(urllib.request.HTTPSHandler(context=ctx))
+    opener = urllib.request.build_opener(*handlers)
+    with opener.open(request, timeout=API_FETCH_TIMEOUT_SECONDS) as response:
+        return read_limited(response).decode("utf-8", errors="replace")
 
 def fetch_api_text_with_deadline(
     url: str,
@@ -982,6 +995,8 @@ def api_network_sources() -> list[tuple[str, str]]:
         ("github_pages_https", MIRROR_HTTPS_URL),
         ("github_pages_http_redirect_https", MIRROR_HTTP_URL),
     ]
+    if WEB_FALLBACK_ENABLED:
+        configured.append(("official_web_https", official_web.SOURCE_URL))
     sources: list[tuple[str, str]] = []
     seen: set[str] = set()
     for label, url in configured:
@@ -990,6 +1005,8 @@ def api_network_sources() -> list[tuple[str, str]]:
             continue
         if not normalized.startswith(("https://", "http://")):
             print(f"[配置警告] 忽略不支持的节点源 URL: {normalized}", flush=True)
+            continue
+        if normalized.startswith("http://") and not ALLOW_INSECURE_NODE_SOURCES:
             continue
         seen.add(normalized)
         sources.append((label, normalized))
@@ -1083,14 +1100,21 @@ def fetch_candidates() -> list[dict[str, Any]]:
         load_ui_config().get("discovery_countries")
     )
     last_err: Exception | None = None
-    log_to_json("INFO", "Main", "开始按官方、GitHub Pages、本地缓存顺序拉取节点列表...")
+    log_to_json("INFO", "Main", "开始按官方 API、GitHub Pages、官方网页、本地缓存顺序拉取节点列表...")
 
     for source_name, url in api_network_sources():
         try:
             msg = f"尝试节点源 {source_name}: {url}"
             print(f"[fetch_candidates] {msg}", flush=True)
             log_to_json("INFO", "Main", msg)
-            api_text = fetch_api_text_with_deadline(url, True)
+            if source_name == "official_web_https":
+                api_text = official_web.fetch_snapshot(
+                    lambda page: fetch_api_text_with_deadline(page, True),
+                    max_nodes=min(MAX_SCAN_ROWS, 100),
+                    preferred_countries=discovery_countries,
+                )
+            else:
+                api_text = fetch_api_text_with_deadline(url, True)
             rows = parse_vpngate_rows(api_text)
             candidates = rows_to_candidates(rows, blacklist)
             if not candidates:
@@ -1689,12 +1713,13 @@ def apply_routing_filters(
 ) -> list[dict[str, Any]]:
     candidates = list(nodes)
     routing_mode = ui_cfg.get("routing_mode", "auto")
-    target_country = ui_cfg.get("force_country", "")
+    target_countries = manual_target.routing_countries(ui_cfg)
 
-    if routing_mode == "fixed_region" and target_country:
+    if routing_mode == "fixed_region":
         candidates = [
             n for n in candidates
-            if country_matches(n.get("country"), target_country, n.get("country_short"))
+            if any(country_matches(n.get("country"), country, n.get("country_short"))
+                   for country in target_countries)
         ]
     elif routing_mode == "favorites":
         fav_ids = set(ui_cfg.get("favorite_node_ids", []))
@@ -1752,6 +1777,13 @@ def country_matches(
         return str(node_country_short or "").strip().upper() == target_upper
     return normalized_country_name(node_country).casefold() == normalized_country_name(target).casefold()
 
+def routing_country_payload(payload: dict[str, Any]) -> tuple[str, list[str]]:
+    if "force_countries" in payload:
+        countries = manual_target.country_codes(payload["force_countries"], allow_empty=True)
+        return (countries[0] if len(countries) == 1 else ""), countries
+    legacy = normalize_routing_country(payload.get("force_country"), read_nodes())
+    return legacy, [legacy] if re.fullmatch(r"[A-Z]{2}", legacy) else []
+
 def probe_priority_key(node: dict[str, Any]) -> tuple[int, int, int, int]:
     ping = parse_int(node.get("ping")) or 999999
     return (
@@ -1775,9 +1807,10 @@ def validate_node_allowed_by_routing(node: dict[str, Any], ui_cfg: dict[str, Any
     node_id = str(node.get("id") or "")
 
     if routing_mode == "fixed_region":
-        target_country = ui_cfg.get("force_country", "")
-        if target_country and not country_matches(node.get("country"), target_country, node.get("country_short")):
-            raise RuntimeError(f"当前已锁定国家【{target_country}】，不能连接其他国家节点")
+        target_countries = manual_target.routing_countries(ui_cfg)
+        if not any(country_matches(node.get("country"), country, node.get("country_short"))
+                   for country in target_countries):
+            raise RuntimeError(f"当前已限定国家【{', '.join(target_countries)}】，不能连接范围外的节点")
     elif routing_mode == "favorites":
         fav_ids = set(ui_cfg.get("favorite_node_ids", []))
         if node_id not in fav_ids:
@@ -2133,7 +2166,7 @@ def auto_switch_node(attempt: int = 0) -> None:
         return
 
     routing_mode = ui_cfg.get("routing_mode", "auto")
-    target_country = ui_cfg.get("force_country", "")
+    target_countries = manual_target.routing_countries(ui_cfg)
 
     if routing_mode == "fixed_ip":
         print("[自动切换] 当前处于固定 IP 模式，不进行自动连接或切换。", flush=True)
@@ -2165,8 +2198,8 @@ def auto_switch_node(attempt: int = 0) -> None:
             auto_switch_node(attempt + 1)
     else:
         msg = "没有可用的备选节点，将自动断开并清理当前连接状态，同时在后台异步获取新节点..."
-        if routing_mode == "fixed_region" and target_country:
-            msg = f"没有可用的【{target_country}】备选节点，已断开连接，将在后台持续尝试获取新节点..."
+        if routing_mode == "fixed_region":
+            msg = f"没有可用的【{', '.join(target_countries)}】备选节点，已断开连接，将在后台持续尝试获取新节点..."
         print(f"[自动切换] {msg}", flush=True)
         log_to_json("WARNING", "VPN", msg)
         stop_active_openvpn()
@@ -2195,18 +2228,29 @@ def recover_after_manual_connect_failure(previous_node_id: str) -> None:
     if ui_cfg.get("connection_enabled", True) and ui_cfg.get("routing_mode") != "fixed_ip":
         auto_switch_node()
 
-def connect_node(node_id: str) -> str:
+def connect_node(node_id: str, *, target: dict[str, Any] | None = None) -> str:
     global active_openvpn_process, active_openvpn_node_id
     global last_active_ping_time, last_active_latency
     global consecutive_proxy_failures, last_proxy_failure_node_id
     node_id = str(node_id or "").strip()
-    if not node_id:
+    if not node_id and target is None:
         raise ValueError("Node id is required")
 
     token, cancel_event = begin_connection_attempt()
     stopped_existing = False
     previous_node_id = ""
+    state_before: dict[str, Any] = {}
+    policy_update: dict[str, Any] | None = None
+    original_signature: tuple[Any, ...] | None = None
+    selected_signature: tuple[Any, ...] | None = None
     try:
+        state_before = get_state()
+        nodes = read_nodes()
+        ui_cfg = load_ui_config()
+        if target is not None:
+            node_id, policy_update = manual_target.resolve_target(nodes, target)
+            original_signature = manual_target.routing_signature(ui_cfg)
+            ui_cfg.update(policy_update)
         set_state(
             is_connecting=True,
             pending_node_id=node_id,
@@ -2218,7 +2262,6 @@ def connect_node(node_id: str) -> str:
         )
         log_to_json("INFO", "VPN", f"开始连接节点: {node_id}")
 
-        nodes = read_nodes()
         node = next((item for item in nodes if item.get("id") == node_id), None)
         if not node:
             raise ValueError(f"Node not found: {node_id}")
@@ -2227,11 +2270,10 @@ def connect_node(node_id: str) -> str:
             if active_openvpn_running():
                 previous_node_id = active_openvpn_node_id
         
-        ui_cfg = load_ui_config()
         validate_node_allowed_by_routing(node, ui_cfg)
         ui_cfg["connection_enabled"] = True
         auth_file = DATA_DIR / "ui_auth.json"
-        with lock:
+        if policy_update is None:
             DATA_DIR.mkdir(exist_ok=True, parents=True)
             write_json(auth_file, ui_cfg)
 
@@ -2245,10 +2287,12 @@ def connect_node(node_id: str) -> str:
 
         probed_at = float(node.get("probed_at", 0) or 0)
         should_preflight = (
-            SWITCH_PREFLIGHT_MAX_AGE_SECONDS > 0
-            and bool(previous_node_id)
+            bool(previous_node_id)
             and previous_node_id != node_id
-            and time.time() - probed_at > SWITCH_PREFLIGHT_MAX_AGE_SECONDS
+            and (policy_update is not None or (
+                SWITCH_PREFLIGHT_MAX_AGE_SECONDS > 0
+                and time.time() - probed_at > SWITCH_PREFLIGHT_MAX_AGE_SECONDS
+            ))
         )
         if should_preflight:
             set_state(active_node_latency="切换预检", last_check_message="正在保持当前连接并预检目标节点...")
@@ -2282,9 +2326,24 @@ def connect_node(node_id: str) -> str:
 
         if not connection_attempt_is_current(token, cancel_event):
             raise ConnectionCancelled("连接操作已取消")
+        if policy_update is not None:
+            with lock:
+                if not connection_attempt_is_current(token, cancel_event):
+                    raise ConnectionCancelled("连接操作已取消")
+                latest = load_ui_config()
+                if manual_target.routing_signature(latest) != original_signature:
+                    raise ConnectionCancelled("预检期间路由配置已变更，请重新选择目标")
+                latest.update(policy_update)
+                latest["connection_enabled"] = True
+                write_json(auth_file, latest)
+                selected_signature = manual_target.routing_signature(latest)
         set_state(active_node_latency="清理连接", last_check_message="目标节点可用，正在关闭旧的 VPN 连接及网卡...")
         stop_active_openvpn()
         stopped_existing = True
+        # Stopping the current node removes its profile. Re-selecting that same
+        # node must recreate the file before OpenVPN reads it again.
+        config_path.write_text(node.get("config_text") or "", encoding="utf-8")
+        config_path.chmod(0o600)
 
         set_state(active_node_latency="启动核心", last_check_message="正在启动 OpenVPN Core 核心服务并建立连接...")
         ok, message, process = run_openvpn_until_ready(
@@ -2343,20 +2402,21 @@ def connect_node(node_id: str) -> str:
         res = check_proxy_health()
         if not connection_attempt_is_current(token, cancel_event):
             raise ConnectionCancelled("连接操作已取消")
-        if not res["ok"]:
+        if not res["ok"] or not routing_ready:
             route_note = "；策略路由配置失败" if not routing_ready else ""
             raise RuntimeError(f"VPN 隧道已建立但代理出口不可用{route_note}: {res.get('error', '未知错误')}")
-
-        latest_ui_cfg = load_ui_config()
-        validate_node_allowed_by_routing(node, latest_ui_cfg)
-        latest_ui_cfg["connection_enabled"] = True
-        if latest_ui_cfg.get("routing_mode") == "fixed_ip":
-            latest_ui_cfg["fixed_node_id"] = node_id
 
         latency_str = f"{last_active_latency} ms" if last_active_latency > 0 else "检测超时"
         with lock:
             if not connection_attempt_is_current(token, cancel_event):
                 raise ConnectionCancelled("连接操作已取消")
+            latest_ui_cfg = load_ui_config()
+            if policy_update is not None and manual_target.routing_signature(latest_ui_cfg) != selected_signature:
+                raise ConnectionCancelled("连接期间路由配置已变更，已取消旧目标")
+            validate_node_allowed_by_routing(node, latest_ui_cfg)
+            latest_ui_cfg["connection_enabled"] = True
+            if latest_ui_cfg.get("routing_mode") == "fixed_ip":
+                latest_ui_cfg["fixed_node_id"] = node_id
             current_nodes = read_nodes()
             for item in current_nodes:
                 item["active"] = item.get("id") == node_id
@@ -2387,10 +2447,14 @@ def connect_node(node_id: str) -> str:
         return f"Connected {node_id}"
     except ConnectionCancelled:
         if stopped_existing:
-            stop_active_openvpn()
+            clear_active_connection_state("目标切换已取消")
+        elif active_openvpn_running():
+            set_state(**{key: state_before.get(key) for key in (
+                "tunnel_ready", "proxy_ready", "proxy_ok", "active_node_latency",
+            )})
         raise
     except Exception as exc:
-        if stopped_existing or (active_openvpn_node_id == node_id and not active_openvpn_running()):
+        if stopped_existing or (node_id and active_openvpn_node_id == node_id and not active_openvpn_running()):
             with lock:
                 current_nodes = read_nodes()
                 failed_node = next((item for item in current_nodes if item.get("id") == node_id), None)
@@ -2402,6 +2466,10 @@ def connect_node(node_id: str) -> str:
             clear_active_connection_state(f"连接失败: {exc}")
         else:
             set_state(is_connecting=False, pending_node_id="", last_check_message=f"连接失败: {exc}")
+            if active_openvpn_running():
+                set_state(**{key: state_before.get(key) for key in (
+                    "tunnel_ready", "proxy_ready", "proxy_ok", "active_node_latency",
+                )})
         raise
     finally:
         finish_connection_attempt(token, cancel_event)
@@ -3440,6 +3508,37 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
     }
 
+    .manual-target-panel {
+      padding: 20px;
+      margin-bottom: 24px;
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      background: var(--bg-surface);
+    }
+    .manual-target-panel h2 { margin: 0 0 8px; font-size: 16px; }
+    .manual-target-panel p { color: var(--text-secondary); font-size: 13px; margin: 8px 0; }
+    .manual-target-forms { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 20px; }
+    .manual-target-forms form { display: flex; gap: 10px; flex-direction: column; min-width: 0; }
+    .manual-target-forms label { font-size: 13px; color: var(--text-secondary); }
+    .manual-target-forms input, .manual-target-forms select {
+      box-sizing: border-box;
+      width: 100%;
+      min-width: 0;
+      height: 42px;
+      padding: 0 10px;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      background: var(--bg-main, #0f172a);
+      color: var(--text-primary);
+      font: inherit;
+    }
+    .manual-target-forms input:focus, .manual-target-forms select:focus { outline: 2px solid var(--primary, #818cf8); outline-offset: 2px; }
+    .routing-country-options { display: flex; flex-wrap: wrap; gap: 8px; padding: 10px; max-height: 156px; overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px; background: var(--bg-main, #0f172a); }
+    .routing-country-options label { display: inline-flex; align-items: center; gap: 7px; padding: 7px 10px; border: 1px solid var(--border-color); border-radius: 7px; cursor: pointer; color: var(--text-primary); font-size: 13px; }
+    .routing-country-options label:has(input:checked) { border-color: var(--primary, #818cf8); background: rgba(99, 102, 241, 0.18); }
+    .routing-country-options input[type="checkbox"] { width: 16px; height: 16px; min-width: 16px; padding: 0; margin: 0; accent-color: var(--primary, #818cf8); }
+    .manual-target-forms [hidden] { display: none; }
+
     .toolbar select {
       width: 180px;
       height: 42px;
@@ -4232,6 +4331,27 @@ INDEX_HTML = r"""<!doctype html>
 
 
 
+  <section class="manual-target-panel" aria-labelledby="manual_target_heading">
+    <h2 id="manual_target_heading">手动切换出口</h2>
+    <p>代理入口保持不变。切换会影响所有客户端，并可能中断已有连接。</p>
+    <div class="manual-target-forms">
+      <form onsubmit="selectManualTarget(event, 'ip')">
+        <label for="manual_target_ip">节点入口 IP</label>
+        <input id="manual_target_ip" type="text" placeholder="输入节点列表中的 IPv4 或 IPv6" required autocomplete="off" oninput="resetManualTargetChoices()">
+        <label for="manual_target_connection" id="manual_target_connection_label" hidden>连接方式</label>
+        <select id="manual_target_connection" hidden></select>
+        <button id="manual_target_ip_submit" type="submit" class="btn-primary">切换并固定此节点</button>
+      </form>
+      <form onsubmit="selectManualTarget(event, 'country')">
+        <span id="manual_target_country_label">出口国家（可多选）</span>
+        <div id="manual_target_country" class="routing-country-options" role="group" aria-labelledby="manual_target_country_label" onchange="manualCountriesDirty = true"></div>
+        <button id="manual_target_country_submit" type="submit" class="btn-primary">切换并限定所选国家</button>
+        <p>可同时选择美国和加拿大。节点失效时仅在所选国家内切换；无可用节点时保持断开。</p>
+      </form>
+    </div>
+    <p id="manual_target_status" role="status" aria-live="polite"></p>
+  </section>
+
   <section class="toolbar">
     <select id="status_filter">
       <option value="all">全部节点</option>
@@ -4420,10 +4540,8 @@ INDEX_HTML = r"""<!doctype html>
           </div>
           
           <div id="net_force_country_group" class="form-group" style="margin-bottom: 16px; display: none;">
-            <label class="form-label" for="net_force_country">锁定国家地区</label>
-            <select id="net_force_country" class="input-field" style="background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-color); color: var(--text-primary); outline: none; cursor: pointer; width: 100%; height: 40px; border-radius: 8px; padding: 0 12px;">
-              <option value="">正在加载节点国家...</option>
-            </select>
+            <span id="net_force_country_label" class="form-label">限定国家地区（可多选）</span>
+            <div id="net_force_country" class="routing-country-options" role="group" aria-labelledby="net_force_country_label"></div>
           </div>
           
           <div class="form-group" style="margin-bottom: 16px;">
@@ -4613,6 +4731,8 @@ INDEX_HTML = r"""<!doctype html>
 </main>
 <script>
 let nodes=[], state={}, testingNodeIds = new Set();
+let manualTargetInFlight = false;
+let manualCountriesDirty = false;
 const favoriteRequestIds = new Set();
 let disconnectInFlight = false;
 let currentPage = 1;
@@ -4871,6 +4991,9 @@ function updateCountryFilterLabel() {
 function updateCountryFilter() {
   syncDiscoveryCountriesFromState();
   const countries = new Map();
+  // Allow searching for a country even before its first relay is discovered.
+  countries.set("US", { code: "US", name: "美国", count: 0 });
+  countries.set("CA", { code: "CA", name: "加拿大", count: 0 });
   nodes.forEach(node => {
     if (!node) return;
     const code = String(node.country_short || "").trim().toUpperCase();
@@ -4999,6 +5122,7 @@ function stableSortNodes() {
 }
 
 function render(){
+  renderManualTargetControls();
   const versionLabel = state.app_version_label || "V2.1.5 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
@@ -5403,6 +5527,92 @@ function startConnectionPolling() {
   }, 1000);
 }
 
+function renderManualTargetControls() {
+  const selected = manualCountriesDirty ? selectedRoutingCountries("manual_target_country") : savedRoutingCountries();
+  renderRoutingCountryCheckboxes("manual_target_country", selected);
+  const busy = manualTargetInFlight || Boolean(state.is_connecting) || Boolean(state.maintenance_running);
+  $("manual_target_ip_submit").disabled = busy;
+  $("manual_target_country_submit").disabled = busy;
+}
+
+function savedRoutingCountries() {
+  const saved = Array.isArray(state.force_countries) && state.force_countries.length
+    ? state.force_countries : [state.force_country];
+  return saved.map(code => String(code || "").trim().toUpperCase()).filter(code => /^[A-Z]{2}$/.test(code));
+}
+
+function selectedRoutingCountries(id) {
+  return Array.from($(id).querySelectorAll('input[type="checkbox"]:checked'), input => input.value);
+}
+
+function renderRoutingCountryCheckboxes(id, selected) {
+  const countries = new Map([["US", "美国"], ["CA", "加拿大"]]);
+  nodes.forEach(node => {
+    const code = String(node.country_short || "").toUpperCase();
+    if (/^[A-Z]{2}$/.test(code)) countries.set(code, node.country || code);
+  });
+  selected.forEach(code => { if (!countries.has(code)) countries.set(code, code); });
+  const ordered = Array.from(countries).sort((a, b) => {
+    const rank = code => code === "US" ? 0 : code === "CA" ? 1 : 2;
+    return rank(a[0]) - rank(b[0]) || a[0].localeCompare(b[0]);
+  });
+  // Include selection in the signature: background polling must retain unsaved choices.
+  const signature = JSON.stringify([ordered, [...selected].sort()]);
+  const container = $(id);
+  if (container.dataset.signature === signature) return;
+  container.innerHTML = ordered.map(([code, name]) => `<label><input type="checkbox" value="${esc(code)}" ${selected.includes(code) ? "checked" : ""}><span>${esc(name)} (${esc(code)})</span></label>`).join("");
+  container.dataset.signature = signature;
+}
+
+function resetManualTargetChoices() {
+  $("manual_target_connection").hidden = true;
+  $("manual_target_connection").innerHTML = "";
+  $("manual_target_connection_label").hidden = true;
+}
+
+async function selectManualTarget(event, mode) {
+  event.preventDefault();
+  if (manualTargetInFlight) return;
+  const payload = mode === "ip"
+    ? { mode, ip: $("manual_target_ip").value.trim() }
+    : { mode, countries: selectedRoutingCountries("manual_target_country") };
+  const choice = $("manual_target_connection");
+  if (mode === "ip" && !choice.hidden && choice.value) payload.node_id = choice.value;
+  const status = $("manual_target_status");
+  if (mode === "country" && !payload.countries.length) {
+    status.textContent = "请至少选择一个出口国家。";
+    return;
+  }
+  manualTargetInFlight = true;
+  renderManualTargetControls();
+  status.textContent = "正在检查并切换目标，请稍候…";
+  try {
+    const response = await fetchWithTimeout("./api/select_target", {
+      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload)
+    }, 180000);
+    const result = await response.json();
+    if (response.status === 409 && Array.isArray(result.candidates) && result.candidates.length) {
+      choice.innerHTML = '<option value="">选择连接方式</option>' + result.candidates.map(node => `<option value="${esc(node.id)}">${esc(node.proto || "VPN")} / ${esc(node.remote_port)} · ${esc(node.id)}</option>`).join("");
+      choice.hidden = false;
+      $("manual_target_connection_label").hidden = false;
+      status.textContent = "该 IP 有多个连接方式，请选择后再次切换。";
+      choice.focus();
+    } else if (!response.ok || !result.ok) {
+      status.textContent = result.error || "目标切换失败，请检查连接状态。";
+    } else {
+      resetManualTargetChoices();
+      manualCountriesDirty = false;
+      status.textContent = mode === "ip" ? "已切换并固定此节点。" : "已切换并限定所选国家。";
+    }
+  } catch (error) {
+    status.textContent = "未收到切换结果，请查看当前连接状态；请求可能仍在处理中。";
+  } finally {
+    manualTargetInFlight = false;
+    try { await load(); } catch (error) {}
+    renderManualTargetControls();
+  }
+}
+
 async function connectNode(id){
   state.is_connecting = true;
   state.pending_node_id = id;
@@ -5713,6 +5923,7 @@ async function toggleFavRouting() {
       body: JSON.stringify({
         routing_mode: newMode,
         force_country: state.force_country || "",
+        force_countries: savedRoutingCountries(),
         routing_ip_type: state.routing_ip_type || "all"
       })
     }, 25000);
@@ -5780,7 +5991,7 @@ function handleRoutingModeChange(mode) {
     warningDiv.style.color = "var(--warning)";
     warningDiv.style.background = "rgba(245, 158, 11, 0.1)";
     warningDiv.style.border = "1px solid rgba(245, 158, 11, 0.2)";
-    warningDiv.innerHTML = `⚠️ <strong>固定地区</strong>：限制仅连接选定国家的节点，且后台仅并发测速该国家的节点。如果该国的所有可用节点都失效，会造成代理中断且<strong>绝不自动切换到其他国家</strong>的节点。`;
+    warningDiv.innerHTML = `⚠️ <strong>固定地区</strong>：可以选择多个国家，仅连接和检测所选国家内的节点。当前节点失效时，在这些国家内选择备用节点；全部失效时保持断开。`;
   } else if (mode === "favorites") {
     countryGroup.style.display = "none";
     warningDiv.style.color = "var(--warning)";
@@ -5803,35 +6014,7 @@ function handleRoutingModeChange(mode) {
 }
 
 function populateRoutingCountries() {
-  const select = $("net_force_country");
-  if (!select) return;
-  const countMap = {};
-  nodes.forEach(n => {
-    const code = String(n.country_short || "").trim().toUpperCase();
-    const c = translateCountry(n.country);
-    if (/^[A-Z]{2}$/.test(code) && c) {
-      const current = countMap[code] || {name: c, count: 0};
-      current.count += 1;
-      countMap[code] = current;
-    }
-  });
-  
-  const countries = Object.keys(countMap).sort((a, b) => countMap[a].name.localeCompare(countMap[b].name, "zh-CN"));
-  let html = '<option value="">请选择要锁定的国家...</option>';
-  countries.forEach(code => {
-    html += `<option value="${esc(code)}">${esc(countryFlag(code))} ${esc(countMap[code].name)} (${countMap[code].count}个节点)</option>`;
-  });
-  select.innerHTML = html;
-  
-  if (state) {
-    const saved = String(state.force_country || "").trim();
-    if (/^[A-Za-z]{2}$/.test(saved)) {
-      select.value = saved.toUpperCase();
-    } else {
-      const legacy = countries.find(code => countMap[code].name === translateCountry(saved));
-      select.value = legacy || "";
-    }
-  }
+  renderRoutingCountryCheckboxes("net_force_country", savedRoutingCountries());
 }
 
 function openCredentialsModal() {
@@ -5978,7 +6161,7 @@ async function saveNetwork(e) {
   
   const proxyPort = parseInt($("net_proxy_port").value);
   const routingMode = $("net_routing_mode").value;
-  const forceCountry = $("net_force_country").value;
+  const forceCountries = selectedRoutingCountries("net_force_country");
   const routingIpType = $("net_routing_ip_type").value;
   
   if (isNaN(proxyPort) || proxyPort < 1024 || proxyPort > 65535) {
@@ -5993,8 +6176,8 @@ async function saveNetwork(e) {
     return;
   }
   
-  if (routingMode === "fixed_region" && !forceCountry) {
-    errorDivEl.textContent = "请选择一个要锁定的目标国家";
+  if (routingMode === "fixed_region" && !forceCountries.length) {
+    errorDivEl.textContent = "请至少选择一个出口国家";
     errorDivEl.style.display = "block";
     return;
   }
@@ -6014,7 +6197,7 @@ async function saveNetwork(e) {
       body: JSON.stringify({
         proxy_port: proxyPort,
         routing_mode: routingMode,
-        force_country: forceCountry,
+        force_countries: forceCountries,
         routing_ip_type: routingIpType
       })
     }, 25000);
@@ -6343,7 +6526,7 @@ def check_proxy_health() -> dict[str, Any]:
             proxy_url = f"socks5h://{p_host}:{LOCAL_PROXY_PORT}"
             proxy_user, proxy_pass = proxy_server.get_proxy_credentials()
             cmd = [
-                "curl", "-s",
+                "curl", "-s", "--fail", "--proto", "=https", "--noproxy", "",
                 "-w", "\n%{time_total} %{http_code}",
                 "-x", proxy_url,
                 url,
@@ -6361,6 +6544,7 @@ def check_proxy_health() -> dict[str, Any]:
                         if len(time_info) == 2:
                             total_time_str, http_code = time_info
                             if http_code == "200" and ip:
+                                ip = str(ipaddress.ip_address(ip))
                                 latency_ms = int(float(total_time_str) * 1000)
                                 return {"ok": True, "ip": ip, "latency_ms": latency_ms}
             except Exception:
@@ -6368,10 +6552,10 @@ def check_proxy_health() -> dict[str, Any]:
         return None
 
     try:
-        result = _curl_check_ip("http://ip.sb")
+        result = _curl_check_ip("https://api.ipify.org")
         if result:
             return result
-        result = _curl_check_ip("http://api.ipify.org")
+        result = _curl_check_ip("https://icanhazip.com")
         if result:
             return result
             
@@ -6858,6 +7042,32 @@ class Handler(BaseHTTPRequestHandler):
             self.send_json({"error": "Unauthorized"}, HTTPStatus.UNAUTHORIZED)
             return
 
+        if effective_path == "/api/select_target":
+            if self.headers.get_content_type() != "application/json":
+                self.send_json({"ok": False, "error": "请使用 application/json"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+                return
+            origin = self.headers.get("Origin")
+            host = self.headers.get("Host", "")
+            if origin is not None and origin not in (f"http://{host}", f"https://{host}"):
+                self.send_json({"ok": False, "error": "拒绝跨来源目标切换"}, HTTPStatus.FORBIDDEN)
+                return
+            try:
+                payload = self.read_json_body()
+                message = connect_node("", target=payload)
+                self.send_json({"ok": True, "message": message, "state": get_state()})
+            except manual_target.TargetError as exc:
+                self.send_json({"ok": False, "error": str(exc), "candidates": exc.candidates}, exc.status)
+            except (ValueError, UnicodeError) as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
+            except ConnectionCancelled as exc:
+                self.send_json({"ok": False, "cancelled": True, "error": str(exc)}, HTTPStatus.CONFLICT)
+            except RuntimeError as exc:
+                status = HTTPStatus.CONFLICT if str(exc).startswith("当前已有") else HTTPStatus.BAD_GATEWAY
+                self.send_json({"ok": False, "error": str(exc)}, status)
+            except Exception:
+                self.send_json({"ok": False, "error": "目标切换失败，请检查服务日志"}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            return
+
         if effective_path == "/api/update_credentials":
             try:
                 payload = self.read_json_body()
@@ -6928,7 +7138,7 @@ class Handler(BaseHTTPRequestHandler):
                 
                 new_proxy_port = payload.get("proxy_port")
                 routing_mode = str(payload.get("routing_mode") or "auto").strip()
-                force_country = normalize_routing_country(payload.get("force_country"), read_nodes())
+                force_country, force_countries = routing_country_payload(payload)
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
                 
                 try:
@@ -6942,7 +7152,7 @@ class Handler(BaseHTTPRequestHandler):
                 if routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites"):
                     self.send_json({"ok": False, "error": "无效的路由配置模式"}, HTTPStatus.BAD_REQUEST)
                     return
-                if routing_mode == "fixed_region" and not force_country:
+                if routing_mode == "fixed_region" and not (force_country or force_countries):
                     self.send_json({"ok": False, "error": "启用固定地区前，请先选择一个要锁定的国家"}, HTTPStatus.BAD_REQUEST)
                     return
                 if routing_ip_type not in ("all", "residential", "hosting"):
@@ -6963,6 +7173,7 @@ class Handler(BaseHTTPRequestHandler):
                 ui_cfg["proxy_port"] = new_proxy_port_int
                 ui_cfg["routing_mode"] = routing_mode
                 ui_cfg["force_country"] = force_country
+                ui_cfg["force_countries"] = force_countries
                 ui_cfg["routing_ip_type"] = routing_ip_type
                 if routing_mode == "favorites":
                     ui_cfg["fav_fail_fallback"] = False
@@ -6989,6 +7200,8 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     message = policy_message or "配置更新成功，已即时生效！"
                     self.send_json({"ok": True, "restart_needed": False, "message": message})
+            except manual_target.TargetError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -6997,14 +7210,14 @@ class Handler(BaseHTTPRequestHandler):
             try:
                 payload = self.read_json_body()
                 routing_mode = str(payload.get("routing_mode") or "auto").strip()
-                force_country = normalize_routing_country(payload.get("force_country"), read_nodes())
+                force_country, force_countries = routing_country_payload(payload)
                 routing_ip_type = str(payload.get("routing_ip_type") or "all").strip()
                 fav_fail_fallback = False
                 
                 if routing_mode not in ("auto", "fixed_ip", "fixed_region", "favorites"):
                     self.send_json({"ok": False, "error": "无效的路由配置模式"}, HTTPStatus.BAD_REQUEST)
                     return
-                if routing_mode == "fixed_region" and not force_country:
+                if routing_mode == "fixed_region" and not (force_country or force_countries):
                     self.send_json({"ok": False, "error": "启用固定地区前，请先选择一个要锁定的国家"}, HTTPStatus.BAD_REQUEST)
                     return
                 if routing_ip_type not in ("all", "residential", "hosting"):
@@ -7019,6 +7232,7 @@ class Handler(BaseHTTPRequestHandler):
 
                 ui_cfg["routing_mode"] = routing_mode
                 ui_cfg["force_country"] = force_country
+                ui_cfg["force_countries"] = force_countries
                 ui_cfg["routing_ip_type"] = routing_ip_type
                 ui_cfg["fav_fail_fallback"] = fav_fail_fallback
                 if routing_mode == "fixed_ip":
@@ -7033,6 +7247,8 @@ class Handler(BaseHTTPRequestHandler):
                 policy_message = enforce_active_node_allowed_by_routing(ui_cfg, "出站路由配置已更新")
                 
                 self.send_json({"ok": True, "message": policy_message or "出站路由配置更新成功，已即时生效！"})
+            except manual_target.TargetError as exc:
+                self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.BAD_REQUEST)
             except Exception as exc:
                 self.send_json({"ok": False, "error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
             return
@@ -7258,6 +7474,7 @@ class Tee:
         return getattr(self.stdout, attr)
 
 def main() -> None:
+    proxy_server.get_proxy_credentials()
     ensure_dirs()
     kill_existing_openvpn_processes()
     

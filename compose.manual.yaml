@@ -1,0 +1,39 @@
+# Local build of the reviewed fork, with a dedicated container network namespace.
+# Supply both LOCAL_PROXY_USER and LOCAL_PROXY_PASS before starting.
+services:
+  manual-proxy:
+    image: aimili-manual-proxy:local
+    pull_policy: never
+    build:
+      context: .
+      args:
+        BUILD_VERSION: manual-local
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    ports:
+      - "127.0.0.1:8787:8787"
+      - "127.0.0.1:7928:7928"
+    environment:
+      DEPLOYMENT_MODE: docker
+      VPNGATE_DATA_DIR: /data
+      UI_HOST: "0.0.0.0"
+      UI_PORT: "8787"
+      LOCAL_PROXY_HOST: "0.0.0.0"
+      LOCAL_PROXY_PORT: "7928"
+      LOCAL_PROXY_USER: "${LOCAL_PROXY_USER:?请设置非空代理用户名}"
+      LOCAL_PROXY_PASS: "${LOCAL_PROXY_PASS:?请设置非空代理密码}"
+      ALLOW_INSECURE_NODE_SOURCES: "0"
+    volumes:
+      - manual-proxy-data:/data
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+volumes:
+  manual-proxy-data:
