@@ -3537,7 +3537,8 @@ INDEX_HTML = r"""<!doctype html>
     .routing-country-options label { display: inline-flex; align-items: center; gap: 7px; padding: 7px 10px; border: 1px solid var(--border-color); border-radius: 7px; cursor: pointer; color: var(--text-primary); font-size: 13px; }
     .routing-country-options label:has(input:checked) { border-color: var(--primary, #818cf8); background: rgba(99, 102, 241, 0.18); }
     .routing-country-options input[type="checkbox"] { width: 16px; height: 16px; min-width: 16px; padding: 0; margin: 0; accent-color: var(--primary, #818cf8); }
-    .manual-target-forms [hidden] { display: none; }
+    .manual-target-forms [hidden], .routing-country-options label[hidden], .country-filter-options label[hidden] { display: none; }
+    .country-search { width: 100%; box-sizing: border-box; padding: 9px 10px; border: 1px solid var(--border-color); border-radius: 8px; background: var(--bg-main, #0f172a); color: var(--text-primary); }
 
     .toolbar select {
       width: 180px;
@@ -4344,6 +4345,7 @@ INDEX_HTML = r"""<!doctype html>
       </form>
       <form onsubmit="selectManualTarget(event, 'country')">
         <span id="manual_target_country_label">出口国家（可多选）</span>
+        <input id="manual_target_country_search" class="country-search" type="search" aria-label="搜索出口国家" placeholder="搜索国家名称或代码" oninput="filterCountryOptions('manual_target_country', this.value)">
         <div id="manual_target_country" class="routing-country-options" role="group" aria-labelledby="manual_target_country_label" onchange="manualCountriesDirty = true"></div>
         <button id="manual_target_country_submit" type="submit" class="btn-primary">切换并限定所选国家</button>
         <p>可同时选择美国和加拿大。节点失效时仅在所选国家内切换；无可用节点时保持断开。</p>
@@ -4373,6 +4375,7 @@ INDEX_HTML = r"""<!doctype html>
         </svg>
       </button>
       <div id="country_filter_panel" class="country-filter-panel" role="group" aria-label="国家筛选" hidden>
+        <input id="country_filter_options_search" class="country-search" type="search" aria-label="搜索节点筛选国家" placeholder="搜索国家名称或代码" oninput="filterCountryOptions('country_filter_options', this.value)">
         <div id="country_filter_options" class="country-filter-options"></div>
         <div class="country-filter-footer">
           <button class="country-filter-clear" type="button" onclick="clearDiscoveryCountries(event)">清空选择</button>
@@ -4541,6 +4544,7 @@ INDEX_HTML = r"""<!doctype html>
           
           <div id="net_force_country_group" class="form-group" style="margin-bottom: 16px; display: none;">
             <span id="net_force_country_label" class="form-label">限定国家地区（可多选）</span>
+            <input id="net_force_country_search" class="country-search" type="search" aria-label="搜索限定国家" placeholder="搜索国家名称或代码" oninput="filterCountryOptions('net_force_country', this.value)">
             <div id="net_force_country" class="routing-country-options" role="group" aria-labelledby="net_force_country_label"></div>
           </div>
           
@@ -4990,10 +4994,9 @@ function updateCountryFilterLabel() {
 
 function updateCountryFilter() {
   syncDiscoveryCountriesFromState();
-  const countries = new Map();
-  // Allow searching for a country even before its first relay is discovered.
-  countries.set("US", { code: "US", name: "美国", count: 0 });
-  countries.set("CA", { code: "CA", name: "加拿大", count: 0 });
+  const countries = new Map(Array.from(countryChoices(), ([code, name]) =>
+    [code, { code, name, count: 0 }]
+  ));
   nodes.forEach(node => {
     if (!node) return;
     const code = String(node.country_short || "").trim().toUpperCase();
@@ -5039,6 +5042,7 @@ function updateCountryFilter() {
   document.querySelectorAll(".country-option-input").forEach(input => {
     input.checked = selectedDiscoveryCountries.has(input.value);
   });
+  filterCountryOptions("country_filter_options", $("country_filter_options_search").value);
   updateCountryFilterLabel();
 }
 
@@ -5545,11 +5549,31 @@ function selectedRoutingCountries(id) {
   return Array.from($(id).querySelectorAll('input[type="checkbox"]:checked'), input => input.value);
 }
 
+function countryChoices() {
+  // ISO 3166-1 options must remain available when discovery narrows the node list.
+  if (!countryChoices.catalog) {
+    const codes = "AD AE AF AG AI AL AM AO AQ AR AS AT AU AW AX AZ BA BB BD BE BF BG BH BI BJ BL BM BN BO BQ BR BS BT BV BW BY BZ CA CC CD CF CG CH CI CK CL CM CN CO CR CU CV CW CX CY CZ DE DJ DK DM DO DZ EC EE EG EH ER ES ET FI FJ FK FM FO FR GA GB GD GE GF GG GH GI GL GM GN GP GQ GR GS GT GU GW GY HK HM HN HR HT HU ID IE IL IM IN IO IQ IR IS IT JE JM JO JP KE KG KH KI KM KN KP KR KW KY KZ LA LB LC LI LK LR LS LT LU LV LY MA MC MD ME MF MG MH MK ML MM MN MO MP MQ MR MS MT MU MV MW MX MY MZ NA NC NE NF NG NI NL NO NP NR NU NZ OM PA PE PF PG PH PK PL PM PN PR PS PT PW PY QA RE RO RS RU RW SA SB SC SD SE SG SH SI SJ SK SL SM SN SO SR SS ST SV SX SY SZ TC TD TF TG TH TJ TK TL TM TN TO TR TT TV TW TZ UA UG UM US UY UZ VA VC VE VG VI VN VU WF WS YE YT ZA ZM ZW".split(" ");
+    let names;
+    try { names = new Intl.DisplayNames(["zh-CN"], { type: "region" }); } catch (error) {}
+    const fallback = { US: "美国", CA: "加拿大", JP: "日本", KR: "韩国", GB: "英国", DE: "德国", SG: "新加坡" };
+    countryChoices.catalog = new Map(codes.map(code => [code, names ? names.of(code) : (fallback[code] || code)]));
+  }
+  return new Map(countryChoices.catalog);
+}
+
+function filterCountryOptions(id, query) {
+  const term = String(query || "").trim().toLocaleLowerCase();
+  $(id).querySelectorAll("label").forEach(label => {
+    const input = label.querySelector("input");
+    label.hidden = Boolean(term && !`${label.textContent} ${input.value}`.toLocaleLowerCase().includes(term));
+  });
+}
+
 function renderRoutingCountryCheckboxes(id, selected) {
-  const countries = new Map([["US", "美国"], ["CA", "加拿大"]]);
+  const countries = countryChoices();
   nodes.forEach(node => {
     const code = String(node.country_short || "").toUpperCase();
-    if (/^[A-Z]{2}$/.test(code)) countries.set(code, node.country || code);
+    if (/^[A-Z]{2}$/.test(code) && !countries.has(code)) countries.set(code, node.country || code);
   });
   selected.forEach(code => { if (!countries.has(code)) countries.set(code, code); });
   const ordered = Array.from(countries).sort((a, b) => {
@@ -5562,6 +5586,8 @@ function renderRoutingCountryCheckboxes(id, selected) {
   if (container.dataset.signature === signature) return;
   container.innerHTML = ordered.map(([code, name]) => `<label><input type="checkbox" value="${esc(code)}" ${selected.includes(code) ? "checked" : ""}><span>${esc(name)} (${esc(code)})</span></label>`).join("");
   container.dataset.signature = signature;
+  const search = $(id + "_search");
+  if (search) filterCountryOptions(id, search.value);
 }
 
 function resetManualTargetChoices() {

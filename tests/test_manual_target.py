@@ -332,6 +332,97 @@ class HealthProbeTests(unittest.TestCase):
 
 
 class ManualTargetFormTests(unittest.TestCase):
+    def test_country_choices_and_drafts_survive_filtered_and_empty_node_lists(self):
+        if not shutil.which("node"):
+            self.skipTest("Node.js is not installed")
+        discovery = manager.INDEX_HTML.split("function syncDiscoveryCountriesFromState() {", 1)[1].split("function getFilteredNodes()", 1)[0]
+        routing = manager.INDEX_HTML.split("function renderManualTargetControls() {", 1)[1].split("function resetManualTargetChoices()", 1)[0]
+        functions = "function syncDiscoveryCountriesFromState() {" + discovery + "\nfunction renderManualTargetControls() {" + routing
+        harness = r'''
+const assert = require('node:assert/strict');
+const vm = require('node:vm');
+function element() {
+ const result = {value:'', textContent:'', dataset:{}, inputs:[], labels:[],
+   querySelectorAll(selector) {
+     if (selector === 'label') return this.labels;
+     return selector.includes(':checked') ? this.inputs.filter(input => input.checked) : this.inputs;
+   }};
+ Object.defineProperty(result, 'innerHTML', {set(html) {
+   this.labels = Array.from(html.matchAll(/<label\b[^>]*>([\s\S]*?)<\/label>/g), match => {
+     const tag = match[1].match(/<input\b[^>]*>/)[0];
+     const input = {value:tag.match(/value="([^"]*)"/)[1], checked:/\bchecked\b/.test(tag)};
+     return {hidden:false, textContent:match[1].replace(/<[^>]*>/g, ''),
+       querySelector(){return input;}, input};
+   });
+   this.inputs = this.labels.map(label => label.input);
+ }});
+ return result;
+}
+const ids = ['manual_target_country', 'net_force_country', 'country_filter_options',
+ 'manual_target_country_search', 'net_force_country_search', 'country_filter_options_search',
+ 'manual_target_ip_submit', 'manual_target_country_submit', 'country_filter_label'];
+const elements = Object.fromEntries(ids.map(id => [id, element()]));
+const ctx = {
+ nodes:[{country_short:'US', country:'United States'}],
+ state:{force_countries:['US','CA'], discovery_countries:['US','CA']},
+ $:id=>elements[id], esc:s=>String(s), translateCountry:s=>s, countryFlag:s=>s,
+ document:{querySelectorAll(){return elements.country_filter_options.inputs;}},
+ render(){ctx.renderManualTargetControls();}
+};
+vm.createContext(ctx);
+vm.runInContext(`let manualTargetInFlight=false, manualCountriesDirty=false;
+ let selectedDiscoveryCountries=new Set(), discoveryCountriesInitialized=false,
+ discoveryCountriesDirty=false, countryFilterSignature='', currentPage=1;\n` + FUNCTIONS, ctx);
+const checked = id => elements[id].inputs.filter(input=>input.checked).map(input=>input.value).sort();
+const input = (id, code) => elements[id].inputs.find(input=>input.value===code);
+ctx.updateCountryFilter(); ctx.renderManualTargetControls();
+ctx.renderRoutingCountryCheckboxes('net_force_country', ['US','CA']);
+for (const id of ['manual_target_country','net_force_country','country_filter_options']) {
+ assert.equal(elements[id].inputs.length, 249);
+ for (const code of ['US','CA','JP','DE','GB','SG']) assert.ok(input(id, code));
+}
+// Edit after a prior selection, then receive the old persisted state again.
+input('manual_target_country','US').checked=false;
+input('manual_target_country','JP').checked=true;
+vm.runInContext('manualCountriesDirty=true', ctx);
+input('country_filter_options','US').checked=false;
+ctx.toggleDiscoveryCountry(input('country_filter_options','US'));
+input('country_filter_options','JP').checked=true;
+ctx.toggleDiscoveryCountry(input('country_filter_options','JP'));
+ctx.updateCountryFilter(); ctx.renderManualTargetControls();
+assert.deepEqual(checked('manual_target_country'), ['CA','JP']);
+assert.deepEqual(checked('country_filter_options'), ['CA','JP']);
+// Even an empty result must allow searching for a different country.
+ctx.nodes=[];
+ctx.updateCountryFilter(); ctx.renderManualTargetControls();
+assert.equal(elements.country_filter_options.inputs.length, 249);
+assert.equal(elements.manual_target_country.inputs.length, 249);
+assert.deepEqual(checked('manual_target_country'), ['CA','JP']);
+assert.deepEqual(checked('country_filter_options'), ['CA','JP']);
+for (const id of ['manual_target_country','net_force_country','country_filter_options']) {
+ elements[id+'_search'].value='DE';
+ ctx.filterCountryOptions(id, 'DE');
+ assert.deepEqual(elements[id].labels.filter(label=>!label.hidden).map(label=>label.input.value), ['DE']);
+}
+// Node updates retain the search, including in a rebuilt routing control.
+ctx.state.force_countries=['CA'];
+ctx.renderRoutingCountryCheckboxes('net_force_country', ['CA']);
+ctx.updateCountryFilter();
+assert.deepEqual(elements.net_force_country.labels.filter(label=>!label.hidden).map(label=>label.input.value), ['DE']);
+assert.deepEqual(checked('country_filter_options'), ['CA','JP']);
+ctx.filterCountryOptions('country_filter_options', '');
+assert.equal(elements.country_filter_options.labels.filter(label=>!label.hidden).length, 249);
+ctx.clearDiscoveryCountries(); ctx.updateCountryFilter();
+assert.deepEqual(checked('country_filter_options'), []);
+// Legacy browsers without DisplayNames still offer codes and common names.
+vm.runInContext('countryChoices.catalog=null; Intl.DisplayNames=undefined;', ctx);
+assert.equal(ctx.countryChoices().size, 249);
+assert.equal(ctx.countryChoices().get('JP'), '日本');
+'''
+        result = subprocess.run(["node", "-e", "const FUNCTIONS = " + json.dumps(functions) + ";\n" + harness],
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(0, result.returncode, result.stderr)
+
     def test_form_disambiguates_ip_and_submits_country_without_node_id(self):
         if not shutil.which("node"):
             self.skipTest("Node.js is not installed")
