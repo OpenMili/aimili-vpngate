@@ -3539,6 +3539,15 @@ INDEX_HTML = r"""<!doctype html>
     .routing-country-options input[type="checkbox"] { width: 16px; height: 16px; min-width: 16px; padding: 0; margin: 0; accent-color: var(--primary, #818cf8); }
     .manual-target-forms [hidden], .routing-country-options label[hidden], .country-filter-options label[hidden] { display: none; }
     .country-search { width: 100%; box-sizing: border-box; padding: 9px 10px; border: 1px solid var(--border-color); border-radius: 8px; background: var(--bg-main, #0f172a); color: var(--text-primary); }
+    .country-dropdown { position: relative; min-width: 0; }
+    .country-dropdown summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; box-sizing: border-box; min-height: 42px; padding: 10px; border: 1px solid var(--border-color); border-radius: 8px; background: var(--bg-main, #0f172a); color: var(--text-primary); cursor: pointer; list-style: none; }
+    .country-dropdown summary::-webkit-details-marker { display: none; }
+    .country-dropdown summary::after { content: "▾"; flex-shrink: 0; }
+    .country-dropdown[open] summary::after { content: "▴"; }
+    .country-dropdown summary:focus-visible { outline: 2px solid var(--primary, #818cf8); outline-offset: 2px; }
+    .country-dropdown-menu { position: absolute; z-index: 1200; top: calc(100% + 6px); left: 0; right: 0; padding: 10px; border: 1px solid var(--border-color); border-radius: 8px; background: var(--bg-surface); box-shadow: 0 12px 28px rgba(0, 0, 0, 0.35); }
+    .country-dropdown-menu .routing-country-options { flex-direction: column; flex-wrap: nowrap; gap: 2px; max-height: 240px; margin-top: 8px; padding: 0; border: 0; background: transparent; }
+    .country-dropdown-menu .routing-country-options label { flex-shrink: 0; border-color: transparent; }
 
     .toolbar select {
       width: 180px;
@@ -4345,8 +4354,13 @@ INDEX_HTML = r"""<!doctype html>
       </form>
       <form onsubmit="selectManualTarget(event, 'country')">
         <span id="manual_target_country_label">出口国家（可多选）</span>
-        <input id="manual_target_country_search" class="country-search" type="search" aria-label="搜索出口国家" placeholder="搜索国家名称或代码" oninput="filterCountryOptions('manual_target_country', this.value)">
-        <div id="manual_target_country" class="routing-country-options" role="group" aria-labelledby="manual_target_country_label" onchange="manualCountriesDirty = true"></div>
+        <details id="manual_target_country_dropdown" class="country-dropdown" onkeydown="if (event.key === 'Escape') { this.open = false; this.querySelector('summary').focus(); }">
+          <summary id="manual_target_country_summary" aria-labelledby="manual_target_country_label manual_target_country_summary">请选择出口国家</summary>
+          <div class="country-dropdown-menu">
+            <input id="manual_target_country_search" class="country-search" type="search" aria-label="搜索出口国家" placeholder="搜索国家名称或代码" oninput="filterCountryOptions('manual_target_country', this.value)">
+            <div id="manual_target_country" class="routing-country-options" role="group" aria-labelledby="manual_target_country_label" onchange="manualCountriesDirty = true; updateManualCountryLabel()"></div>
+          </div>
+        </details>
         <button id="manual_target_country_submit" type="submit" class="btn-primary">切换并限定所选国家</button>
         <p>可同时选择美国和加拿大。节点失效时仅在所选国家内切换；无可用节点时保持断开。</p>
       </form>
@@ -5534,9 +5548,20 @@ function startConnectionPolling() {
 function renderManualTargetControls() {
   const selected = manualCountriesDirty ? selectedRoutingCountries("manual_target_country") : savedRoutingCountries();
   renderRoutingCountryCheckboxes("manual_target_country", selected);
+  updateManualCountryLabel();
   const busy = manualTargetInFlight || Boolean(state.is_connecting) || Boolean(state.maintenance_running);
   $("manual_target_ip_submit").disabled = busy;
   $("manual_target_country_submit").disabled = busy;
+}
+
+function updateManualCountryLabel() {
+  const summary = $("manual_target_country_summary");
+  if (!summary) return;
+  const countries = countryChoices();
+  const selected = selectedRoutingCountries("manual_target_country");
+  const names = selected.map(code => `${countries.get(code) || code} (${code})`);
+  summary.textContent = names.length ? names.slice(0, 2).join("、") + (names.length > 2 ? ` 等 ${names.length} 个国家` : "") : "请选择出口国家";
+  summary.title = names.join("、");
 }
 
 function savedRoutingCountries() {
@@ -5609,6 +5634,8 @@ async function selectManualTarget(event, mode) {
     status.textContent = "请至少选择一个出口国家。";
     return;
   }
+  const dropdown = $("manual_target_country_dropdown");
+  if (dropdown) dropdown.open = false;
   manualTargetInFlight = true;
   renderManualTargetControls();
   status.textContent = "正在检查并切换目标，请稍候…";
@@ -5728,6 +5755,10 @@ $("country_filter_button").onclick = event => {
   setCountryFilterOpen(!isOpen);
 };
 $("country_filter_panel").onclick = event => event.stopPropagation();
+document.addEventListener("click", event => {
+  const dropdown = $("manual_target_country_dropdown");
+  if (dropdown && !dropdown.contains(event.target)) dropdown.open = false;
+}, true);
 document.addEventListener("click", () => setCountryFilterOpen(false));
 document.addEventListener("keydown", event => {
   if (event.key === "Escape") {

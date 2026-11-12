@@ -360,7 +360,8 @@ function element() {
 }
 const ids = ['manual_target_country', 'net_force_country', 'country_filter_options',
  'manual_target_country_search', 'net_force_country_search', 'country_filter_options_search',
- 'manual_target_ip_submit', 'manual_target_country_submit', 'country_filter_label'];
+ 'manual_target_ip_submit', 'manual_target_country_submit', 'country_filter_label',
+ 'manual_target_country_summary'];
 const elements = Object.fromEntries(ids.map(id => [id, element()]));
 const ctx = {
  nodes:[{country_short:'US', country:'United States'}],
@@ -376,6 +377,7 @@ vm.runInContext(`let manualTargetInFlight=false, manualCountriesDirty=false;
 const checked = id => elements[id].inputs.filter(input=>input.checked).map(input=>input.value).sort();
 const input = (id, code) => elements[id].inputs.find(input=>input.value===code);
 ctx.updateCountryFilter(); ctx.renderManualTargetControls();
+assert.match(elements.manual_target_country_summary.textContent, /美国 \(US\).*加拿大 \(CA\)/);
 ctx.renderRoutingCountryCheckboxes('net_force_country', ['US','CA']);
 for (const id of ['manual_target_country','net_force_country','country_filter_options']) {
  assert.equal(elements[id].inputs.length, 249);
@@ -391,6 +393,7 @@ input('country_filter_options','JP').checked=true;
 ctx.toggleDiscoveryCountry(input('country_filter_options','JP'));
 ctx.updateCountryFilter(); ctx.renderManualTargetControls();
 assert.deepEqual(checked('manual_target_country'), ['CA','JP']);
+assert.match(elements.manual_target_country_summary.textContent, /加拿大 \(CA\).*日本 \(JP\)/);
 assert.deepEqual(checked('country_filter_options'), ['CA','JP']);
 // Even an empty result must allow searching for a different country.
 ctx.nodes=[];
