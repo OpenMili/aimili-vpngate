@@ -402,6 +402,7 @@ class ManagerLogicTests(unittest.TestCase):
             raise AssertionError(f"unexpected source: {url}")
 
         with (
+            mock.patch.object(manager, "ALLOW_INSECURE_NODE_SOURCES", True),
             mock.patch.object(manager, "fetch_api_text_with_deadline", side_effect=fake_fetch) as fetch_mock,
             mock.patch.object(manager, "load_blacklist", return_value={}),
             mock.patch.object(manager, "log_to_json"),
@@ -681,6 +682,7 @@ class ManagerLogicTests(unittest.TestCase):
             return csv_text
 
         with (
+            mock.patch.object(manager, "ALLOW_INSECURE_NODE_SOURCES", True),
             mock.patch.object(manager, "fetch_api_text", side_effect=fake_fetch) as fetch_mock,
             mock.patch.object(manager, "load_blacklist", return_value={}),
             mock.patch.object(manager, "set_state"),
@@ -973,7 +975,7 @@ class ManagerLogicTests(unittest.TestCase):
 
         self.assertEqual(1, len(nodes))
         self.assertEqual(
-            [manager.API_HTTPS_URL, manager.API_HTTP_URL, manager.MIRROR_HTTPS_URL],
+            [manager.API_HTTPS_URL, manager.MIRROR_HTTPS_URL],
             [call.args[0] for call in fetch_mock.call_args_list],
         )
         self.assertEqual(csv_text, manager.API_CACHE_FILE.read_text(encoding="utf-8"))
@@ -990,6 +992,7 @@ class ManagerLogicTests(unittest.TestCase):
             raise TimeoutError("TLS unavailable")
 
         with (
+            mock.patch.object(manager, "ALLOW_INSECURE_NODE_SOURCES", True),
             mock.patch.object(manager, "fetch_api_text", side_effect=fake_fetch),
             mock.patch.object(manager, "load_blacklist", return_value={}),
             mock.patch.object(manager, "log_to_json"),
@@ -1012,6 +1015,28 @@ class ManagerLogicTests(unittest.TestCase):
 
         self.assertEqual("198.51.100.30", nodes[0]["ip"])
         self.assertEqual("local_cache", manager.get_state()["last_fetch_source"])
+
+    def test_official_web_fallback_caches_all_countries_before_filtering(self) -> None:
+        csv_text = valid_snapshot_rows([
+            ("198.51.100.80", "Canada", "CA"),
+            ("198.51.100.81", "Japan", "JP"),
+        ])
+        manager.persist_discovery_countries(["CA"])
+        with (
+            mock.patch.object(manager, "api_network_sources", return_value=[
+                ("official_https", manager.API_HTTPS_URL),
+                ("official_web_https", manager.official_web.SOURCE_URL),
+            ]),
+            mock.patch.object(manager, "fetch_api_text_with_deadline", side_effect=ValueError("blank API")),
+            mock.patch.object(manager.official_web, "fetch_snapshot", return_value=csv_text),
+            mock.patch.object(manager, "load_blacklist", return_value={}),
+            mock.patch.object(manager, "log_to_json"),
+        ):
+            nodes = manager.fetch_candidates()
+        self.assertEqual(["CA"], [n["country_short"] for n in nodes])
+        self.assertEqual(csv_text, manager.API_CACHE_FILE.read_text())
+        self.assertEqual("official_web_https", manager.get_state()["last_fetch_source"])
+        self.assertEqual("ok", manager.get_state()["last_fetch_status"])
 
     def test_bundled_snapshot_seeds_local_cache(self) -> None:
         bundled_text = valid_snapshot("198.51.100.40")

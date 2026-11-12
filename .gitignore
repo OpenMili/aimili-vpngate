@@ -25,6 +25,9 @@ build/
 
 # ---- 运行时数据 ----
 vpngate_data/
+.runtime/
+.env
+.env.*
 logs/
 *.log
 *.tmp
@@ -59,6 +62,7 @@ scratch/
 _site/
 *连接配置*
 test_*.py
+!tests/test_*.py
 *.bak
 *.orig
 

@@ -42,11 +42,13 @@ jobs:
         shell: bash
         run: test "${RELEASE_TAG}" = "v$(tr -d '\r\n' < VERSION)"
       - name: Compile Python sources
-        run: python -m py_compile vpngate_manager.py vpn_utils.py proxy_server.py snapshot_utils.py
+        run: python -m py_compile vpngate_manager.py vpn_utils.py proxy_server.py snapshot_utils.py manual_target.py proxyctl.py official_web.py
       - name: Validate installation script
         run: bash -n install.sh
       - name: Validate Docker Compose configuration
-        run: docker compose -f compose.yaml config >/dev/null
+        run: |
+          docker compose -f compose.yaml config >/dev/null
+          LOCAL_PROXY_USER=validation LOCAL_PROXY_PASS=validation docker compose -f compose.manual.yaml config >/dev/null
       - name: Run unit tests
         run: python -m unittest discover -s tests -v
 

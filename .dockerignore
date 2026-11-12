@@ -3,6 +3,9 @@
 __pycache__
 *.pyc
 vpngate_data
+.runtime
+.env
+.env.*
 dist
 build
 tests
