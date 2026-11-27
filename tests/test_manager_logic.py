@@ -111,6 +111,8 @@ class ManagerLogicTests(unittest.TestCase):
         manager.active_openvpn_node_id = ""
         manager.active_connection_cancel_event = None
         manager.is_connecting = False
+        manager.connecting_node_id = ""
+        manager.verified_node_wakeup.clear()
         manager.consecutive_proxy_failures = 0
         manager.last_proxy_failure_node_id = ""
         manager.background_refill_thread = None
@@ -149,7 +151,7 @@ class ManagerLogicTests(unittest.TestCase):
         manager.write_json(manager.NODES_FILE, nodes)
         return nodes
 
-    def test_node_probe_stops_after_target_batch(self) -> None:
+    def test_node_probe_covers_the_whole_pool(self) -> None:
         nodes = self.write_nodes(12)
         calls = []
 
@@ -165,14 +167,13 @@ class ManagerLogicTests(unittest.TestCase):
         ):
             results = manager.test_multiple_nodes(
                 [node["id"] for node in nodes],
-                target_available=3,
             )
 
-        self.assertEqual(5, len(calls))
-        self.assertEqual(5, len(results))
+        self.assertEqual(12, len(calls))
+        self.assertEqual(12, len(results))
         stored = manager.read_nodes()
-        self.assertEqual(5, sum(node.get("probe_status") == "available" for node in stored))
-        self.assertEqual(7, sum(node.get("probe_status") == "not_checked" for node in stored))
+        self.assertEqual(12, sum(node.get("probe_status") == "available" for node in stored))
+        self.assertEqual(0, sum(node.get("probe_status") == "not_checked" for node in stored))
 
     def test_ip_classification_separates_proxy_use_from_network_type(self) -> None:
         residential, residential_reason = manager.vpn_utils.classify_ip_type(
@@ -532,7 +533,6 @@ class ManagerLogicTests(unittest.TestCase):
         ):
             results = manager.test_multiple_nodes(
                 [node["id"] for node in nodes],
-                target_available=3,
             )
 
         self.assertEqual(5, openvpn_mock.call_count)
@@ -558,7 +558,8 @@ class ManagerLogicTests(unittest.TestCase):
             result = manager.maintain_valid_nodes()
 
         self.assertEqual(5, openvpn_mock.call_count)
-        self.assertIn("Tested 5", result)
+        self.assertIn("已检测 5/12", result)
+        self.assertIn("检测已暂停", result)
 
     def test_cancel_pending_connection_stops_handshake_process(self) -> None:
         process = FakeProcess()
@@ -586,6 +587,7 @@ class ManagerLogicTests(unittest.TestCase):
     def test_failed_switch_preflight_keeps_current_connection(self) -> None:
         nodes = self.write_nodes(2)
         nodes[0]["active"] = True
+        nodes[1]["probe_status"] = "available"
         manager.write_json(manager.NODES_FILE, nodes)
         current_process = FakeProcess()
         manager.active_openvpn_process = current_process
@@ -610,6 +612,8 @@ class ManagerLogicTests(unittest.TestCase):
 
     def test_proxy_failure_does_not_report_connection_success(self) -> None:
         nodes = self.write_nodes(1)
+        nodes[0]["probe_status"] = "available"
+        manager.write_json(manager.NODES_FILE, nodes)
         process = FakeProcess()
 
         with (
@@ -1160,28 +1164,126 @@ class ManagerLogicTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             manager.validate_node_allowed_by_routing(dict(stored, ip_type_confidence="low"), config)
 
-    def test_maintenance_releases_state_lock_while_switching(self) -> None:
-        candidate = dict(self.write_nodes(1)[0], probe_status="available")
-        manager.write_json(manager.NODES_FILE, [candidate])
-        can_acquire = threading.Event()
-
-        def observe_switch():
-            def observer():
-                if manager.lock.acquire(timeout=0.3):
-                    can_acquire.set()
-                    manager.lock.release()
-            checker = threading.Thread(target=observer)
-            checker.start()
-            checker.join(1)
+    def test_first_verified_connects_while_later_probes_are_still_pending(self) -> None:
+        nodes = self.write_nodes(4)
+        hold = threading.Event()
+        def probe(n):
+            if n["id"] != "node-0":
+                if not hold.wait(5):
+                    raise AssertionError("unreleased test probe")
+            return {"id": n["id"], "probe_status": "available", "latency_ms": 5}
         with (
-            mock.patch.object(manager, "fetch_candidates", return_value=[candidate]),
-            mock.patch.object(manager, "active_openvpn_running", side_effect=[False, True, False]),
-            mock.patch.object(manager, "test_multiple_nodes", return_value=[]),
-            mock.patch.object(manager, "auto_switch_node", side_effect=observe_switch) as switch,
+            mock.patch.object(manager, "NODE_PROBE_WORKERS", 2),
+            mock.patch.object(manager, "fetch_candidates", return_value=nodes),
+            mock.patch.object(manager, "probe_candidate", side_effect=probe),
+            mock.patch.object(manager, "connect_node") as connect,
         ):
-            manager.maintain_valid_nodes()
-        switch.assert_called_once()
-        self.assertTrue(can_acquire.is_set())
+            thread = threading.Thread(target=manager.maintain_valid_nodes)
+            thread.start()
+            try:
+                self.assertTrue(manager.verified_node_wakeup.wait(3))
+                self.assertTrue(manager.maintenance_lock.locked())
+                self.assertFalse(manager.is_connecting)
+                manager.connect_first_verified()
+                connect.assert_called_once_with("node-0", automatic=True)
+                self.assertEqual("available", next(n for n in manager.read_nodes() if n["id"] == "node-0")["probe_status"])
+            finally:
+                hold.set()
+                thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(4, manager.get_state()["valid_nodes"])
+
+    def test_switch_rejects_unverified_before_touching_existing_tunnel(self) -> None:
+        nodes = self.write_nodes(2)
+        manager.active_openvpn_process = FakeProcess()
+        manager.active_openvpn_node_id = "node-0"
+        for state in ("testing", "not_checked", "unavailable"):
+            nodes[1]["probe_status"] = state
+            manager.write_json(manager.NODES_FILE, nodes)
+            with self.assertRaises(manager.NodeNotReady):
+                manager.connect_node("node-1")
+            self.assertTrue(manager.active_openvpn_running())
+            self.assertFalse(manager.is_connecting)
+
+    def test_display_sort_orders_all_rows_before_pagination(self) -> None:
+        rows = [dict(id=str(i), country_short=country, probe_status=status, latency_ms=latency)
+                for i, (country, status, latency) in enumerate([
+                    ("AU", "unavailable", 2), ("AU", "not_checked", 1), ("US", "available", 1),
+                    ("JP", "available", 100), ("KR", "testing", 3), ("JP", "available", 5)])]
+        self.assertEqual(["5", "3", "2", "4", "1", "0"], [n["id"] for n in manager.sort_all_nodes(rows)])
+
+    def test_seed_and_fresh_feed_probe_same_candidate_only_once(self) -> None:
+        rows = self.write_nodes(3)
+        rows[2].update(active=True, probe_status="available")
+        manager.write_json(manager.NODES_FILE, rows)
+        preferred = manager.reset_cached_probe_results()
+        self.assertEqual("node-2", preferred)
+        self.assertTrue(all(n["probe_status"] == "not_checked" and not n["active"] for n in manager.read_nodes()))
+        with (mock.patch.object(manager, "fetch_candidates", return_value=rows),
+              mock.patch.object(manager, "probe_candidate", side_effect=lambda n: dict(id=n["id"], probe_status="available")) as probe):
+            manager.maintain_valid_nodes(startup_preference=preferred)
+        self.assertCountEqual([c.args[0]["id"] for c in probe.call_args_list], [n["id"] for n in rows])
+
+    def test_dashboard_update_wakes_and_switches_only_completed_rows_during_scan(self) -> None:
+        rows = self.write_nodes(2)
+        cfg = manager.load_ui_config()
+        manager.active_sessions["browser"] = (time.time() + 60, cfg["username"], cfg["password_hash"])
+        with manager.DualStackHTTPServer(("127.0.0.1", 0), manager.Handler) as server:
+            runner = threading.Thread(target=server.serve_forever, daemon=True)
+            runner.start()
+            def request(method, endpoint, body=None):
+                conn = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=3)
+                try:
+                    conn.request(method, f"/{cfg['secret_path']}/api/{endpoint}", body,
+                                 {"Cookie": "session=browser", "Content-Type": "application/json"})
+                    res = conn.getresponse()
+                    return res.status, json.loads(res.read())
+                finally:
+                    conn.close()
+            try:
+                with manager.maintenance_lock:
+                    code, initial = request("GET", "nodes")
+                    self.assertEqual(200, code)
+                    asleep = threading.Event()
+                    original_wait = manager.node_changes.wait_for
+                    def observe_wait(*args, **kwargs):
+                        asleep.set()
+                        return original_wait(*args, **kwargs)
+                    updated = []
+                    with mock.patch.object(manager.node_changes, "wait_for", side_effect=observe_wait):
+                        watcher = threading.Thread(target=lambda: updated.append(request("GET", "nodes?after=" + initial["revision"])))
+                        watcher.start()
+                        self.assertTrue(asleep.wait(2))
+                        rows[1]["probe_status"] = "available"
+                        manager.write_json(manager.NODES_FILE, rows)
+                        watcher.join(2)
+                    code, change = updated[0]
+                    self.assertEqual(200, code)
+                    self.assertNotEqual(initial["revision"], change["revision"])
+                    self.assertEqual("node-1", change["nodes"][0]["id"])
+                    self.assertNotIn("config_text", change["nodes"][0])
+                    self.assertEqual(409, request("POST", "connect", json.dumps({"id": "node-0"}))[0])
+                    with (mock.patch.object(manager, "run_openvpn_until_ready", return_value=(True, "ready", FakeProcess())),
+                          mock.patch.object(manager, "setup_policy_routing", return_value=True),
+                          mock.patch.object(manager, "cleanup_policy_routing"),
+                          mock.patch.object(manager.vpn_utils, "ping_latency_ms", return_value=5),
+                          mock.patch.object(manager, "check_proxy_health", return_value={"ok": True, "ip": "192.0.2.2", "latency_ms": 5})):
+                        self.assertEqual(200, request("POST", "connect", json.dumps({"id": "node-1"}))[0])
+                    self.assertEqual("node-1", manager.active_openvpn_node_id)
+            finally:
+                server.shutdown()
+                runner.join(2)
+
+    def test_new_results_do_not_override_disconnect_or_a_healthy_connection(self) -> None:
+        rows = self.write_nodes(1)
+        rows[0]["probe_status"] = "available"
+        manager.write_json(manager.NODES_FILE, rows)
+        with mock.patch.object(manager, "connect_node") as connect:
+            with mock.patch.object(manager, "active_openvpn_running", return_value=True):
+                manager.connect_first_verified()
+            with mock.patch.object(manager, "load_ui_config", return_value={"connection_enabled": False}):
+                manager.connect_first_verified()
+            connect.assert_not_called()
 
     def test_web_login_migrates_password_and_uses_current_origin(self) -> None:
         auth_path = manager.DATA_DIR / "ui_auth.json"

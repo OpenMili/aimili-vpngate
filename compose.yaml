@@ -30,7 +30,7 @@ services:
       OPENVPN_UPSTREAM_HTTP:
       OPENVPN_UPSTREAM_SOCKS:
       API_SOURCE_DEADLINE_SECONDS:
-      TARGET_VALID_NODES:
+      NODE_PROBE_WORKERS:
     volumes:
       - aimilivpn-data:/data
     init: true
