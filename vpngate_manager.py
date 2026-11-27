@@ -12,6 +12,7 @@ import secrets
 import select
 import shlex
 import signal
+import errno
 import socket
 import subprocess
 import tempfile
@@ -41,7 +42,7 @@ class DualStackHTTPServer(ThreadingHTTPServer):
         try:
             super().__init__(server_address, RequestHandlerClass, bind_and_activate)
         except OSError as e:
-            if self.address_family == socket.AF_INET6:
+            if self.address_family == socket.AF_INET6 and e.errno in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL):
                 fallback_host = "0.0.0.0" if host in ("::", "") else "127.0.0.1"
                 print(f"[警告] 绑定 Web 管理后台 IPv6 {host}:{port} 失败 ({e})，正在尝试回退至 IPv4 {fallback_host} ...", flush=True)
                 # 关闭第一次失败时可能已创建的 socket
@@ -86,6 +87,7 @@ class DualStackHTTPServer(ThreadingHTTPServer):
         super().server_bind()
 
 import auth_store
+import panel_access
 import vpn_utils
 import proxy_server
 import snapshot_utils
@@ -155,7 +157,7 @@ OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
 LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "127.0.0.1")
 LOCAL_PROXY_PORT = env_int("LOCAL_PROXY_PORT", 7928, 1, 65535)
-UI_HOST = os.environ.get("UI_HOST", "127.0.0.1")
+UI_HOST = os.environ.get("UI_HOST", "0.0.0.0")
 UI_SESSION_TTL_SECONDS = env_int("UI_SESSION_TTL_SECONDS", 12 * 3600, 60, 30 * 86400)
 UI_TRUST_LOOPBACK_PROXY = os.environ.get("UI_TRUST_LOOPBACK_PROXY") == "1"
 POLICY_ROUTE_TABLE = env_int("VPNGATE_ROUTE_TABLE", 19709, 256, 2**31 - 1)
@@ -174,7 +176,7 @@ UPDATE_COMMAND = (
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DEFAULT_APP_VERSION = "2.1.6"
+DEFAULT_APP_VERSION = "2.1.7"
 try:
     _version_text = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
 except OSError:
@@ -4196,12 +4198,12 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V2.1.6 正式版</span>
+        <span id="github_version_label">V2.1.7 正式版</span>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content github-dropdown">
         <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V2.1.6 正式版</div>
+          <div id="current_version_label" class="version-current-label">V2.1.7 正式版</div>
           <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
         </div>
         <button id="check_update_btn" type="button" onclick="checkForUpdate(event)">
@@ -5028,7 +5030,7 @@ function stableSortNodes() {
 }
 
 function render(){
-  const versionLabel = state.app_version_label || "V2.1.6 正式版";
+  const versionLabel = state.app_version_label || "V2.1.7 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
   if ($("deployment_mode_label")) {
@@ -7388,11 +7390,28 @@ def schedule_service_restart() -> None:
 
 
 def main() -> None:
-    global service_http_server
+    global service_http_server, UI_HOST, UI_PORT, LOCAL_PROXY_PORT
     vpn_utils.enrichment_stop_event = service_stopping
     signal.signal(signal.SIGTERM, request_service_stop)
     signal.signal(signal.SIGINT, request_service_stop)
     ensure_dirs()
+    cfg = load_ui_config()
+    proxy_server.get_proxy_credentials()
+    proxy_listener, LOCAL_PROXY_PORT = panel_access.bind_available(
+        proxy_server.open_proxy_listener, LOCAL_PROXY_HOST, LOCAL_PROXY_PORT, exclude=(UI_PORT,)
+    )
+    try:
+        server, UI_PORT = panel_access.bind_available(
+            lambda host, port: DualStackHTTPServer((host, port), Handler), UI_HOST, UI_PORT, exclude=(LOCAL_PROXY_PORT,)
+        )
+        if cfg["host"] in ("::", "::1", "") and server.address_family == socket.AF_INET:
+            UI_HOST = server.server_address[0]
+        if (cfg["host"], cfg["port"], cfg["proxy_port"]) != (UI_HOST, UI_PORT, LOCAL_PROXY_PORT):
+            cfg.update(host=UI_HOST, port=UI_PORT, proxy_port=LOCAL_PROXY_PORT)
+            write_json(DATA_DIR / "ui_auth.json", cfg)
+    except BaseException:
+        proxy_listener.close()
+        raise
     kill_existing_openvpn_processes()
     cleanup_stale_configs()
     
@@ -7423,64 +7442,16 @@ def main() -> None:
             "blacklisted_nodes": 0,
         },
     )
-    threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT), daemon=True).start()
-    
-    # Wait for the gateway to officially start
-    print("[网关] 正在启动代理网关...", flush=True)
-    gateway_ready = False
-    is_ipv6 = ":" in LOCAL_PROXY_HOST
-    af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
-    for _ in range(30):
-        s = None
-        try:
-            s = socket.socket(af, socket.SOCK_STREAM)
-            s.settimeout(0.5)
-            connect_host = LOCAL_PROXY_HOST
-            if connect_host in ("::", "0.0.0.0", ""):
-                connect_host = "::1" if is_ipv6 else "127.0.0.1"
-            try:
-                s.connect((connect_host, LOCAL_PROXY_PORT))
-                gateway_ready = True
-                break
-            except Exception:
-                if connect_host == "::1":
-                    try:
-                        s.close()
-                        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                        s.settimeout(0.5)
-                        s.connect(("127.0.0.1", LOCAL_PROXY_PORT))
-                        gateway_ready = True
-                        break
-                    except Exception:
-                        pass
-                raise
-        except Exception:
-            time.sleep(0.5)
-        finally:
-            if s is not None:
-                try:
-                    s.close()
-                except Exception:
-                    pass
-            
-    if gateway_ready:
-        print("[网关] 代理网关已成功启动监听，启动同步与检测脚本...", flush=True)
-    else:
-        print("[警告] 代理网关启动超时，继续执行脚本...", flush=True)
-
+    threading.Thread(target=proxy_server.start_proxy_server, args=(LOCAL_PROXY_HOST, LOCAL_PROXY_PORT, proxy_listener), daemon=True).start()
     threading.Thread(target=collector_loop, daemon=True).start()
     threading.Thread(target=ip_enrichment_loop, daemon=True).start()
     threading.Thread(target=background_proxy_checker, daemon=True).start()
     threading.Thread(target=active_node_pinger, daemon=True).start()
     
-    ui_cfg = load_ui_config()
-    ui_host = ui_cfg.get("host", UI_HOST)
-    ui_port = bounded_int(ui_cfg.get("port"), UI_PORT, 1, 65535)
-    
-    print(f"UI: http://{ui_host}:{ui_port}/", flush=True)
+    print(f"UI: http://{UI_HOST}:{UI_PORT}/", flush=True)
     print(f"Proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}", flush=True)
     try:
-        with DualStackHTTPServer((ui_host, ui_port), Handler) as server:
+        with server:
             service_http_server = server
             if not service_stopping.is_set():
                 server.serve_forever()

@@ -58,6 +58,11 @@ if [[ $standalone == 1 || $bootstrap_release != latest ]]; then
         curl -q --proto '=https' --proto-redir '=https' --fail --silent --show-error --location \
             --retry 2 --connect-timeout 15 --max-time 120 --max-filesize "$3" --output "$2" "$1"
     }
+    if [[ $bootstrap_release == latest && ${AIMILIVPN_NONINTERACTIVE:-0} != 1 ]]; then
+        download "$release_url/latest/download/install.sh" menu.sh 262144
+        if [[ -t 0 ]]; then bash menu.sh; else bash menu.sh </dev/tty; fi
+        exit 0
+    fi
     download "$release_url/$channel/sha256sums.txt" sha256sums.txt 4096
     manifest=$(<sha256sums.txt)
     pattern='^([0-9a-fA-F]{64})[[:blank:]]+\*?aimilivpn-(v[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9})-linux-source\.tar\.gz$'
@@ -94,6 +99,19 @@ if [[ $standalone == 1 || $bootstrap_release != latest ]]; then
     exit 0
 fi
 
+if command -v flock >/dev/null; then
+    exec 8>>/run/aimilivpn-installer.lock
+    flock -n 8 || { echo '另一个 AimiliVPN 安装或卸载正在运行。' >&2; exit 1; }
+fi
+# Both deployment modes share host tunnel and policy-routing resources.
+if command -v docker >/dev/null && docker container inspect aimilivpn >/dev/null 2>&1; then
+    docker_image=$(docker inspect --format '{{.Config.Image}}' aimilivpn)
+    if [[ $docker_image == *aimili-vpngate* ]]; then
+        echo '已安装 AimiliVPN Docker 版。请先卸载原实例，再选择系统版。' >&2
+        exit 1
+    fi
+fi
+
 # 2. Check OS distribution and set package manager
 OS_TYPE=""
 PKG_MGR=""
@@ -104,6 +122,7 @@ fi
 
 case "$OS_TYPE" in
     ubuntu|debian)
+        export NEEDRESTART_MODE=l
         PKG_MGR="apt-get"
         export DEBIAN_FRONTEND=noninteractive
         ;;
@@ -134,7 +153,7 @@ if [ -f "${INSTALL_DIR}/.local_dev" ]; then
     fi
     local_dev=1
 fi
-app_files=(VERSION README.md LICENSE install.sh vpngate_manager.py vpn_utils.py proxy_server.py snapshot_utils.py auth_store.py release_utils.py)
+app_files=(VERSION README.md LICENSE install.sh vpngate_manager.py vpn_utils.py proxy_server.py snapshot_utils.py auth_store.py release_utils.py panel_access.py)
 for file in "${app_files[@]}" mirror/vpngate.csv mirror/vpngate.meta.json; do
     if [ ! -f "$SOURCE_DIR/$file" ]; then
         echo "缺少 $file。请从同一份发行包中校验并解压后运行安装脚本。" >&2
@@ -271,7 +290,11 @@ import shutil
 INSTALL_DIR = "/opt/aimilivpn"
 sys.path.insert(0, INSTALL_DIR)
 import auth_store
+import panel_access
 import release_utils
+from functools import lru_cache
+
+get_panel_host = lru_cache(maxsize=4)(panel_access.public_host)
 
 LOG_FILE = "/opt/aimilivpn/vpngate_data/vpngate.log"
 
@@ -294,9 +317,9 @@ def get_app_version():
     try:
         with open(os.path.join(INSTALL_DIR, "VERSION"), "r", encoding="utf-8") as f:
             version = f.read().strip().lstrip("vV")
-        return version or "2.1.6"
+        return version or "2.1.7"
     except Exception:
-        return "2.1.6"
+        return "2.1.7"
 
 def load_ui_cfg():
     import json
@@ -365,35 +388,6 @@ def get_active_node_info():
         except Exception:
             pass
     return None, None
-
-def get_public_ip():
-    path = "/opt/aimilivpn/vpngate_data/public_ip.txt"
-    if os.path.exists(path):
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                ip = f.read().strip()
-                if ip:
-                    return ip
-        except Exception:
-            pass
-    import urllib.request
-    # Try dual-stack first, then IPv6-only, then IPv4-only
-    for api_url in ["https://api64.ipify.org", "https://api6.ipify.org", "https://api.ipify.org"]:
-        try:
-            req = urllib.request.Request(api_url, headers={"User-Agent": "curl/7.68.0"})
-            with urllib.request.urlopen(req, timeout=2) as r:
-                ip = r.read().decode().strip()
-                if ip:
-                    try:
-                        os.makedirs(os.path.dirname(path), exist_ok=True)
-                        with open(path, "w", encoding="utf-8") as f:
-                            f.write(ip)
-                    except Exception:
-                        pass
-                    return ip
-        except Exception:
-            pass
-    return "您的服务器公网IP"
 
 def check_port_listening(port):
     for host, family in [("127.0.0.1", socket.AF_INET), ("::1", socket.AF_INET6)]:
@@ -500,15 +494,9 @@ def print_status():
     print_line(format_line(f"管理后台 (Port {ui_port})", backend_status))
     print_line(format_line("连接核心 (OpenVPN)", openvpn_status))
     
-    host_cfg = cfg.get("host", "::")
-    if host_cfg in ("127.0.0.1", "localhost"):
-        login_ip = "127.0.0.1"
-    elif host_cfg == "::1":
-        login_ip = "[::1]"
-    elif host_cfg == "::":
-        login_ip = get_public_ip()
-    else:
-        login_ip = f"[{host_cfg}]" if ":" in host_cfg else host_cfg
+    login_ip = get_panel_host(cfg.get("host", "0.0.0.0"))
+    if ":" in login_ip:
+        login_ip = f"[{login_ip}]"
     print_line(format_line("网页登录地址", f"{yellow}http://{login_ip}:{ui_port}/{secret_path}/{reset}"))
     print_line(format_line("网页管理账号", cfg.get("username", "未配置")))
     print_line(format_line("网页管理密码", "已设置" if (cfg.get("password_hash") or cfg.get("password")) else "未配置"))
@@ -965,118 +953,10 @@ if __name__ == "__main__":
 EOF
 chmod +x /usr/bin/ml
 
-# 7. Configure Custom parameters (First-time installation check)
+# The service creates the same credentials for both installation modes.
 AUTH_FILE="${INSTALL_DIR}/vpngate_data/ui_auth.json"
 install -d -m 700 "${INSTALL_DIR}/vpngate_data"
-
-is_custom="n"
-if [ ! -f "$AUTH_FILE" ]; then
-    if [ -t 0 ] && [ "${AIMILIVPN_NONINTERACTIVE:-0}" != "1" ]; then
-        echo -e "\n${YELLOW}检测到是首次安装，是否需要自定义配置网页端参数（端口/安全后缀/登录账号密码）？${PLAIN}"
-        read -p "是否自定义配置？[y/N]: " is_custom
-    else
-        echo -e "\n${YELLOW}检测到是非交互式/无TTY环境安装，已自动跳过网页端参数自定义配置，采用默认随机参数部署。${PLAIN}"
-    fi
-    
-    # Initialize defaults
-    UI_PORT=8787
-    # generate random secret suffix (12 chars alphanumeric)
-    SECRET_PATH=$(python3 -c "import secrets, string; chars = string.ascii_letters + string.digits; print(''.join(secrets.choice(chars) for _ in range(12)))")
-    # generate random password
-    UI_PASSWORD=$(python3 -c "
-import secrets, string
-chars = string.ascii_letters + string.digits
-while True:
-    pwd = ''.join(secrets.choice(chars) for _ in range(12))
-    if any(c.islower() for c in pwd) and any(c.isupper() for c in pwd) and any(c.isdigit() for c in pwd):
-        print(pwd)
-        break
-")
-    UI_USERNAME=$(python3 -c "
-import secrets, string
-chars = string.ascii_letters + string.digits
-while True:
-    uname = ''.join(secrets.choice(chars) for _ in range(12))
-    if uname[0].isalpha() and any(c.islower() for c in uname) and any(c.isupper() for c in uname) and any(c.isdigit() for c in uname):
-        print(uname)
-        break
-")
-
-    if [[ "$is_custom" =~ ^[Yy]$ ]]; then
-        # Step-by-step custom inputs
-        # 1. Custom port
-        while true; do
-            read -p "请输入自定义管理端口 [1-65535, 默认 8787]: " input_port
-            if [ -z "$input_port" ]; then
-                UI_PORT=8787
-                break
-            fi
-            if [[ "$input_port" =~ ^[0-9]+$ ]] && [ "$input_port" -ge 1 ] && [ "$input_port" -le 65535 ]; then
-                UI_PORT=$input_port
-                break
-            else
-                echo -e "${RED}输入错误: 端口必须是 1 到 65535 之间的数字！${PLAIN}"
-            fi
-        done
-        
-        # 2. Custom suffix
-        while true; do
-            read -p "请输入网页登录自定义安全后缀 [字母与数字组合, 默认随机]: " input_suffix
-            if [ -z "$input_suffix" ]; then
-                break
-            fi
-            if [[ "$input_suffix" =~ ^[A-Za-z0-9]+$ ]]; then
-                SECRET_PATH=$input_suffix
-                break
-            else
-                echo -e "${RED}输入错误: 后缀仅能由英文字母和数字组成！${PLAIN}"
-            fi
-        done
-        
-        # 3. Custom login username and password
-        read -p "请输入登录账号 [默认 $UI_USERNAME]: " input_user
-        if [ -n "$input_user" ]; then
-            UI_USERNAME=$input_user
-        fi
-        
-        while true; do
-            read -r -s -p "请输入登录密码 [默认随机生成, 建议包含字母、数字与符号]: " input_pass
-            echo
-            if [ -z "$input_pass" ]; then
-                break
-            fi
-            if [ ${#input_pass} -ge 4 ]; then
-                UI_PASSWORD=$input_pass
-                break
-            else
-                echo -e "${RED}输入错误: 密码长度不能少于 4 位！${PLAIN}"
-            fi
-        done
-    fi
-
-    # Read values from stdin to keep credentials out of process arguments.
-    printf '%s\0' "$UI_PORT" "$SECRET_PATH" "$UI_USERNAME" "$UI_PASSWORD" | python3 -c '
-import json
-import os
-import sys
-import auth_store
-
-auth_file = sys.argv[1]
-ui_port, secret_path, username, password, _ = sys.stdin.buffer.read().decode("utf-8").split("\x00")
-cfg = {
-    "host": os.environ.get("UI_HOST", "127.0.0.1"),
-    "port": int(ui_port),
-    "proxy_port": 7928,
-    "secret_path": secret_path,
-    "username": username,
-}
-auth_store.set_password(cfg, password)
-fd = os.open(auth_file, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-with os.fdopen(fd, "w", encoding="utf-8") as f:
-    json.dump(cfg, f, ensure_ascii=False, indent=2)
-' "$AUTH_FILE"
-fi
-chmod 600 "$AUTH_FILE"
+if [ -f "$AUTH_FILE" ]; then chmod 600 "$AUTH_FILE"; fi
 
 # 8. Start service
 echo -e "\n正在启动 AimiliVPN 服务并初始化网络..."
@@ -1089,70 +969,11 @@ elif command -v rc-service >/dev/null 2>&1; then
     service_status=(rc-service aimilivpn status)
 fi
 
-# Wait for this process to open its management listener. Node fetching is asynchronous.
-if ! python3 - "$AUTH_FILE" <<'PY'
-import json
-import socket
-import sys
-import time
-
-with open(sys.argv[1], encoding="utf-8") as handle:
-    config = json.load(handle)
-host = config.get("host", "127.0.0.1")
-host = {"0.0.0.0": "127.0.0.1", "::": "::1", "": "127.0.0.1"}.get(host, host)
-for _ in range(30):
-    try:
-        with socket.create_connection((host, int(config.get("port", 8787))), timeout=0.5):
-            break
-    except OSError:
-        time.sleep(0.5)
-else:
-    sys.exit(1)
-PY
-then
-    echo -e "${RED}错误: 管理端口未能启动，请检查服务日志。${PLAIN}" >&2
-    exit 1
-fi
+python3 "$INSTALL_DIR/panel_access.py" health --data-dir "$INSTALL_DIR/vpngate_data" --wait 45
 if ((${#service_status[@]})) && ! "${service_status[@]}" >/dev/null; then
-    echo -e "${RED}错误: AimiliVPN 服务未能保持运行，请检查服务日志。${PLAIN}" >&2
+    echo 'AimiliVPN 服务未保持运行，请检查服务日志。' >&2
     exit 1
 fi
-echo "管理服务已启动。节点拉取与连接在后台进行，运行 ml status 查看进度。"
-
-SECRET_PATH=""
-USERNAME="未配置"
-PASSWORD="${UI_PASSWORD:-已设置，忘记密码可运行 ml password}"
-UI_PORT=8787
-PROXY_PORT=7928
-AUTH_FILE="${INSTALL_DIR}/vpngate_data/ui_auth.json"
-if [ -f "$AUTH_FILE" ]; then
-    SECRET_PATH=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('secret_path', ''))" 2>/dev/null || true)
-    USERNAME=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('username', '未配置'))" 2>/dev/null || echo "未配置")
-    UI_PORT=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('port', 8787))" 2>/dev/null || echo "8787")
-    PROXY_PORT=$(python3 -c "import json; print(json.load(open('$AUTH_FILE')).get('proxy_port', 7928))" 2>/dev/null || echo "7928")
-fi
-
-# Get VPS public IP
-echo -e "正在获取 VPS 公网 IP..."
-PUBLIC_IP=$(curl -s --max-time 3 https://api.ipify.org || curl -s --max-time 3 https://ifconfig.me || curl -s --max-time 3 https://icanhazip.com || echo "您的服务器公网IP")
-echo -n "$PUBLIC_IP" > "${INSTALL_DIR}/vpngate_data/public_ip.txt"
-
-# Get VPS public IPv6
-echo -e "正在获取 VPS 公网 IPv6..."
-PUBLIC_IPV6=$(curl -6 -s --max-time 3 https://api.ipify.org || curl -6 -s --max-time 3 https://ifconfig.me || curl -6 -s --max-time 3 https://icanhazip.com || echo "")
-
-echo -e "\n${GREEN}==========================================================${PLAIN}"
-echo -e "${GREEN}             AimiliVPN 源码一键部署已完成！${PLAIN}"
-echo -e "${GREEN}==========================================================${PLAIN}"
-echo -e "  * 网页控制面板:  ${BLUE}http://127.0.0.1:${UI_PORT}/${SECRET_PATH}/${PLAIN}"
-echo -e "  * 远程访问可用 SSH 转发: ssh -L ${UI_PORT}:127.0.0.1:${UI_PORT} root@${PUBLIC_IP}"
-echo -e "  * 网页管理账号:  ${YELLOW}${USERNAME}${PLAIN}"
-echo -e "  * 网页管理密码:  ${YELLOW}${PASSWORD}${PLAIN}"
-echo -e "  * HTTP/SOCKS5 代理端口:  ${BLUE}http://127.0.0.1:${PROXY_PORT}/${PLAIN}"
-echo -e " --------------------------------------------------------"
-echo -e "  * 快速状态指令:   ${YELLOW}ml status${PLAIN}  或  ${YELLOW}ml${PLAIN}"
-echo -e "  * 查看实时日志:   ${YELLOW}ml logs${PLAIN}"
-echo -e "  * 停止服务:       ${YELLOW}ml stop${PLAIN}"
-echo -e "  * 重启服务:       ${YELLOW}ml restart${PLAIN}"
-echo -e "=========================================================="
-echo
+echo '管理服务已启动。'
+python3 "$INSTALL_DIR/panel_access.py" summary --data-dir "$INSTALL_DIR/vpngate_data"
+echo '管理命令  ml'

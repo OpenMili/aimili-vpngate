@@ -14,6 +14,13 @@ fail() {
 if [[ $(uname -s) != Linux || $EUID -ne 0 ]]; then
     fail '请在 Linux VPS 上以 root 运行 Docker 安装脚本。'
 fi
+if command -v flock >/dev/null; then
+    exec 8>>/run/aimilivpn-installer.lock
+    flock -n 8 || { echo '另一个 AimiliVPN 安装或卸载正在运行。' >&2; exit 1; }
+fi
+if [[ -f /opt/aimilivpn/vpngate_manager.py ]] && [[ -f /lib/systemd/system/aimilivpn.service || -f /etc/systemd/system/aimilivpn.service || -f /etc/init.d/aimilivpn ]]; then
+    fail '已安装 AimiliVPN 系统版。请先卸载原实例，再选择 Docker 版。'
+fi
 if [[ ! -c /dev/net/tun ]]; then
     fail '找不到 /dev/net/tun，请先在 VPS 上启用 TUN/TAP。'
 fi
@@ -79,4 +86,4 @@ if ! "${compose[@]}" --file "$config" up -d --no-build --wait --wait-timeout 120
 fi
 "${compose[@]}" --file "$config" ps
 printf '配置文件位置 %s/compose.yaml\n' "$install_dir"
-printf '首次登录可运行 docker exec %s cat /data/ui_bootstrap.json\n' "$container"
+docker exec -e "SSH_CONNECTION=${SSH_CONNECTION:-}" -e "AIMILIVPN_PUBLIC_HOST=${AIMILIVPN_PUBLIC_HOST:-}" "$container" python3 /app/panel_access.py summary

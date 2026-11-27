@@ -21,6 +21,7 @@ RELEASE_FILES = [
     "proxy_server.py",
     "snapshot_utils.py",
     "auth_store.py",
+    "panel_access.py",
     "release_utils.py",
     "Dockerfile",
     "compose.yaml",
@@ -63,6 +64,16 @@ def build_installers(root: Path, output_dir: Path, version: str) -> None:
     docker = docker.replace("@RELEASE_TAG@", f"v{version}").replace("@COMPOSE_YAML@", managed_compose)
     (output_dir / "install-source.sh").write_bytes(source.encode("utf-8"))
     (output_dir / "install-docker.sh").write_bytes(docker.encode("utf-8"))
+    menu = (root / "scripts" / "install-menu.sh.in").read_text(encoding="utf-8")
+    for marker, value in {
+        "@RELEASE_TAG@": f"v{version}",
+        "@SOURCE_SHA@": sha256(output_dir / "install-source.sh"),
+        "@DOCKER_SHA@": sha256(output_dir / "install-docker.sh"),
+    }.items():
+        if menu.count(marker) != 1:
+            raise ValueError(f"无效的安装菜单模板 {marker}")
+        menu = menu.replace(marker, value)
+    (output_dir / "install.sh").write_bytes(menu.encode("utf-8"))
 
 
 def build_archive(root: Path, output_dir: Path) -> Path:

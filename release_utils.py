@@ -97,7 +97,8 @@ def stage_release(release: Release, destination: Path) -> Path:
             with target.open("xb") as output, package.extractfile(entry) as source:
                 shutil.copyfileobj(source, output)
             files.add(PurePosixPath(*path.parts[1:]).as_posix())
-    if not _REQUIRED_FILES <= files:
+    required = _REQUIRED_FILES | ({"panel_access.py"} if version_key(release.tag) >= (2, 1, 7) else set())
+    if not required <= files:
         raise ValueError("Release 缺少完整安装文件，请选择包含新安装器的发行版")
     root = destination / name
     if (root / "VERSION").read_text(encoding="utf-8").strip() != release.tag[1:]:

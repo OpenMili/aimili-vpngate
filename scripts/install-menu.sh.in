@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+release_tag='@RELEASE_TAG@'
+source_sha='@SOURCE_SHA@'
+docker_sha='@DOCKER_SHA@'
+releases=https://github.com/OpenMili/aimili-vpngate/releases
+
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+[[ $(uname -s) == Linux ]] || fail '请在 Linux VPS 上运行。'
+if (( EUID != 0 )); then
+    command -v sudo >/dev/null && [[ -f $0 ]] || fail '请使用 root 或 sudo bash 运行下载的脚本。'
+    exec sudo -- bash "$0" "$@"
+fi
+
+purge() {
+    if command -v flock >/dev/null; then
+        exec 8>>/run/aimilivpn-installer.lock
+        flock -n 8 || { echo '另一个 AimiliVPN 安装或卸载正在运行。' >&2; exit 1; }
+    fi
+    local dir=/opt/aimilivpn-docker project=aimilivpn-docker volume=aimilivpn-docker_aimilivpn-data
+    local image='' owner file expected actual account account_home
+    if command -v docker >/dev/null && docker info >/dev/null 2>&1; then
+        if docker container inspect aimilivpn >/dev/null 2>&1; then
+            owner=$(docker inspect --format '{{index .Config.Labels "com.docker.compose.project"}}|{{index .Config.Labels "com.docker.compose.project.working_dir"}}' aimilivpn)
+            [[ $owner == "$project|$dir" ]] || fail '同名容器由其他方式部署，请用原部署配置卸载。'
+            image=$(docker inspect --format '{{.Config.Image}}' aimilivpn)
+            docker stop -t 20 aimilivpn >/dev/null
+            docker rm aimilivpn
+        fi
+        if docker volume inspect "$volume" >/dev/null 2>&1; then
+            owner=$(docker volume inspect --format '{{index .Labels "com.docker.compose.project"}}|{{index .Labels "com.docker.compose.volume"}}' "$volume")
+            [[ $owner == "$project|aimilivpn-data" ]] || fail "请手动核对数据卷 $volume 的归属。"
+            docker volume rm "$volume"
+        fi
+        if [[ $image == ghcr.io/openmili/aimili-vpngate:* ]] && [[ -z $(docker ps -aq --filter "ancestor=$image") ]]; then
+            docker image rm "$image"
+        fi
+    elif [[ -d $dir ]]; then
+        fail '请先启动 Docker，以清理已有容器和数据卷。'
+    fi
+    if [[ -f /opt/aimilivpn/vpngate_manager.py ]]; then
+        [[ ! -L /opt/aimilivpn && -x /usr/bin/ml ]] && grep -Fq 'INSTALL_DIR = "/opt/aimilivpn"' /usr/bin/ml || fail '系统版目录和 ml 的归属无法确认。'
+        printf 'y\n' | /usr/bin/ml uninstall
+    fi
+    if [[ -d $dir && ! -L $dir ]]; then
+        file=$dir/compose.yaml
+        if [[ -f $file && ! -L $file ]]; then
+            IFS= read -r expected < "$file"
+            actual=$(tail -n +2 "$file" | sha256sum)
+            if [[ $expected == "# AimiliVPN managed compose ${actual%% *}" ]]; then rm -f -- "$file"; fi
+        fi
+        rmdir -- "$dir" 2>/dev/null || printf '保留目录中自定义的文件 %s\n' "$dir"
+    fi
+    for account in root ubuntu "${SUDO_USER:-root}"; do
+        account_home=$(getent passwd "$account" | cut -d: -f6) || continue
+        [[ -d $account_home && $account_home != / && $account_home == /* ]] || continue
+        for file in "$account_home/install-source.sh" "$account_home/install-docker.sh"; do
+            if [[ -f $file && ! -L $file ]] && grep -Fq -e 'release_url=https://github.com/OpenMili/aimili-vpngate/releases' -e 'install_dir=/opt/aimilivpn-docker' "$file"; then rm -f -- "$file"; fi
+        done
+    done
+    printf 'AimiliVPN 清理完成。\n'
+}
+
+[[ $# -le 1 ]] || fail '用法：bash aimili.sh [--source|--docker|--purge]'
+case ${1:-} in
+    --purge) purge; exit 0 ;;
+    --source) mode=source ;;
+    --docker) mode=docker ;;
+    '')
+        printf '\nAimiliVPN %s\n  1) 系统版\n  2) Docker 版\n请选择 [1/2]：' "$release_tag" >&2
+        if [[ -t 0 || -f ${BASH_SOURCE[0]:-} ]]; then
+            IFS= read -r choice || fail '请输入 1 或 2，或使用 --source / --docker。'
+        else
+            IFS= read -r choice </dev/tty || fail '请下载后执行，或使用 --source / --docker。'
+        fi
+        case $choice in 1) mode=source ;; 2) mode=docker ;; *) fail '请输入 1 或 2。' ;; esac ;;
+    *) fail '用法：bash aimili.sh [--source|--docker|--purge]' ;;
+esac
+work=$(mktemp -d)
+trap 'rm -f -- "$work/installer"; rmdir -- "$work"' EXIT
+curl -q --proto '=https' --proto-redir '=https' -fsSL --retry 2 --connect-timeout 15 --max-time 120 \
+    "$releases/download/$release_tag/install-$mode.sh" -o "$work/installer"
+checksum=$source_sha
+if [[ $mode == docker ]]; then checksum=$docker_sha; fi
+(cd -- "$work" && printf '%s  installer\n' "$checksum" | sha256sum -c -)
+AIMILIVPN_NONINTERACTIVE=1 bash "$work/installer"

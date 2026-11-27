@@ -33,22 +33,13 @@ AimiliVPN은 Python 표준 라이브러리로 VPNGate 노드를 관리하며 노
 <a id="quick-install"></a>
 ## 빠른 설치
 
-TUN/TAP이 활성화된 Linux VPS에서 root로 자신의 디렉터리에서 다음 명령 중 하나를 실행합니다. Docker 버전에는 Docker Engine, `up --wait`를 지원하는 Compose, `flock`이 필요합니다.
-
-**소스 버전**
+TUN/TAP을 켠 Linux VPS에서 아래 명령을 실행합니다. **1**은 시스템 서비스, **2**는 Docker 설치입니다. Docker 방식에는 Docker Engine 및 Compose가 필요합니다.
 
 ```bash
-curl -fsSLO https://github.com/OpenMili/aimili-vpngate/releases/latest/download/install-source.sh && bash install-source.sh
+curl -fsSL https://github.com/OpenMili/aimili-vpngate/releases/latest/download/install.sh -o aimili.sh && sudo bash aimili.sh
 ```
 
-**Docker 버전**
-
-```bash
-curl -fsSLO https://github.com/OpenMili/aimili-vpngate/releases/latest/download/install-docker.sh && bash install-docker.sh
-```
-
-> [!TIP]
-> VPS 제어판에서 TUN/TAP을 활성화하고 `/dev/net/tun`이 존재하는지 확인하십시오. Web 기본 포트는 TCP `8787`이며 가능하면 자신의 IP만 허용하십시오.
+완료 시 로그인 URL, 계정, 비밀번호가 표시됩니다. 패널은 `0.0.0.0`에 바인딩하며 `8787`부터 빈 포트를 선택합니다. 표시된 포트에 관리자 IP의 접근을 허용하세요. `sudo bash aimili.sh --purge`는 설치 항목과 데이터를 삭제합니다.
 
 <a id="vps"></a>
 ## 추천 서비스
@@ -131,7 +122,7 @@ docker run -d \
   --cap-add NET_ADMIN \
   --cap-add NET_RAW \
   --device /dev/net/tun:/dev/net/tun \
-  -e UI_HOST=127.0.0.1 \
+  -e UI_HOST=0.0.0.0 \
   -e UI_PORT=8787 \
   -e LOCAL_PROXY_HOST=127.0.0.1 \
   -e LOCAL_PROXY_PORT=7928 \
@@ -161,7 +152,7 @@ docker compose up -d
 소스 설치에서는 설치 프로그램이 출력한 URL을 엽니다.
 
 ```text
-http://127.0.0.1:8787/private_path/
+http://SERVER_IP:PANEL_PORT/private_path/
 ```
 
 비밀번호 해시는 `ui_auth.json`에 저장됩니다. Docker 최초 로그인 파일은 컨테이너 관리자에게만 읽기 가능하며 로그인 후 삭제됩니다.
@@ -170,7 +161,7 @@ http://127.0.0.1:8787/private_path/
 docker exec aimilivpn cat /data/ui_bootstrap.json
 ```
 
-`secret_path`, `username`, `password`로 로그인합니다. 경로를 다시 확인하려면 `ui_auth.json`의 `secret_path`를 봅니다. 원격 관리는 SSH 포트 포워딩을 사용하고 업그레이드 후 기존 `host` 값을 확인합니다.
+`secret_path`, `username`, `password`로 로그인합니다. 경로를 다시 확인하려면 `ui_auth.json`의 `secret_path`를 봅니다. 업그레이드하면 기존 바인딩 주소와 계정을 유지합니다.
 
 ### 2. 노드 가져오기 및 연결
 

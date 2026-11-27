@@ -51,28 +51,15 @@ AimiliVPN 使用 Python 标准库管理 VPNGate 节点，提供节点获取与�
 <a id="quick-install"></a>
 ## 快速安装
 
-在启用了 TUN/TAP 的 Linux VPS 上，以 `root` 在自己的目录中执行下面一条命令。需要 Bash 和 `curl`。
-
-### 源码版一键安装
-
-脚本先核对正式发行包的 SHA-256，再安装系统服务。需要无人值守安装时，可先执行 `export AIMILIVPN_NONINTERACTIVE=1`。
+在启用了 TUN/TAP 的 Linux VPS 上执行下面一条命令，输入 **1** 安装系统版，或输入 **2** 使用已有 Docker Engine 和 Compose 插件安装容器版。
 
 ```bash
-curl -fsSLO https://github.com/OpenMili/aimili-vpngate/releases/latest/download/install-source.sh && bash install-source.sh
+curl -fsSL https://github.com/OpenMili/aimili-vpngate/releases/latest/download/install.sh -o aimili.sh && sudo bash aimili.sh
 ```
 
-### Docker 版一键安装
+安装器会显示完整登录地址、随机账号和密码。新面板监听 `0.0.0.0`，从 `8787` 起选择空闲端口。安全组只需向你的管理 IP 放行显示的 TCP 端口。HTTP/SOCKS5 代理默认绑定回环地址。
 
-需已安装 Docker Engine、支持 `up --wait` 的 Compose 插件和 `flock`。脚本拉取与发行版对应的镜像，将 Compose 配置写入 `/opt/aimilivpn-docker`。同一脚本部署的实例可以再次运行脚本升级，继续使用原数据卷。
-
-```bash
-curl -fsSLO https://github.com/OpenMili/aimili-vpngate/releases/latest/download/install-docker.sh && bash install-docker.sh
-```
-
-已有其他方式部署的 Docker 实例请用原 Compose 文件或原部署命令升级。使用一键脚本部署后，可在 `/opt/aimilivpn-docker/.env` 设置上游代理等选项。
-
-> [!TIP]
-> Web 默认在回环地址监听 TCP `8787`，远程访问可通过 SSH 端口转发。Docker 首次登录凭据可用 `docker exec aimilivpn cat /data/ui_bootstrap.json` 查看。
+**清理测试安装**：在同一目录执行 `sudo bash aimili.sh --purge`。这会删除本项目一键安装的实例、账号和节点数据。
 
 <a id="installation"></a>
 ## 完整安装
@@ -144,7 +131,7 @@ docker run -d \
   --cap-add NET_ADMIN \
   --cap-add NET_RAW \
   --device /dev/net/tun:/dev/net/tun \
-  -e UI_HOST=127.0.0.1 \
+  -e UI_HOST=0.0.0.0 \
   -e UI_PORT=8787 \
   -e LOCAL_PROXY_HOST=127.0.0.1 \
   -e LOCAL_PROXY_PORT=7928 \
@@ -174,7 +161,7 @@ docker compose up -d
 源码安装完成后，使用终端输出的地址访问：
 
 ```text
-http://127.0.0.1:8787/随机安全路径/
+http://服务器公网IP:面板端口/随机安全路径/
 ```
 
 忘记地址时执行 `ml status`；需要重设账号密码时执行 `ml password`。
@@ -185,7 +172,7 @@ http://127.0.0.1:8787/随机安全路径/
 docker exec aimilivpn cat /data/ui_bootstrap.json
 ```
 
-用该文件的 `secret_path`、`username` 和 `password` 登录。忘记后缀时读取 `ui_auth.json` 中的 `secret_path`。远程管理使用 SSH 转发。升级时请核对持久化配置的 `host`，旧安装可能依然监听全网卡。
+用该文件的 `secret_path`、`username` 和 `password` 登录。忘记后缀时读取 `ui_auth.json` 中的 `secret_path`。升级沿用原绑定地址和账号。面板对公网开放时，可用 HTTPS 反向代理保护登录流量。
 
 ### 2. 获取并连接节点
 

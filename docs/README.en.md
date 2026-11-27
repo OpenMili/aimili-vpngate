@@ -34,22 +34,13 @@ AimiliVPN uses Python's standard library to manage VPNGate nodes. It provides no
 <a id="quick-install"></a>
 ## Quick Install
 
-On a Linux VPS with TUN/TAP enabled, run one command as root in your own directory. The Docker option requires Docker Engine, Compose with `up --wait`, and `flock`.
-
-**Source**
+On a Linux VPS with TUN/TAP enabled, run the command below. Enter **1** for a system service or **2** for Docker (requires Docker Engine and Compose).
 
 ```bash
-curl -fsSLO https://github.com/OpenMili/aimili-vpngate/releases/latest/download/install-source.sh && bash install-source.sh
+curl -fsSL https://github.com/OpenMili/aimili-vpngate/releases/latest/download/install.sh -o aimili.sh && sudo bash aimili.sh
 ```
 
-**Docker**
-
-```bash
-curl -fsSLO https://github.com/OpenMili/aimili-vpngate/releases/latest/download/install-docker.sh && bash install-docker.sh
-```
-
-> [!TIP]
-> Enable TUN/TAP in the VPS control panel and verify that `/dev/net/tun` exists. The Web dashboard uses TCP `8787` by default; restrict firewall access to your own IP whenever possible.
+Both options print the login URL, username and password. The panel listens on `0.0.0.0` and selects a free TCP port starting at `8787`. Allow access from your management IP to the displayed port. Run `sudo bash aimili.sh --purge` to remove the installation and its data.
 
 <a id="vps"></a>
 ## Recommended Services
@@ -132,7 +123,7 @@ docker run -d \
   --cap-add NET_ADMIN \
   --cap-add NET_RAW \
   --device /dev/net/tun:/dev/net/tun \
-  -e UI_HOST=127.0.0.1 \
+  -e UI_HOST=0.0.0.0 \
   -e UI_PORT=8787 \
   -e LOCAL_PROXY_HOST=127.0.0.1 \
   -e LOCAL_PROXY_PORT=7928 \
@@ -162,7 +153,7 @@ docker compose up -d
 For a source installation, open the URL printed by the installer:
 
 ```text
-http://127.0.0.1:8787/private_path/
+http://SERVER_IP:PANEL_PORT/private_path/
 ```
 
 Run `ml status` to recover the URL, or `ml password` to reset credentials.
@@ -173,7 +164,7 @@ The Web password hash is stored in `ui_auth.json`. Docker writes the first-login
 docker exec aimilivpn cat /data/ui_bootstrap.json
 ```
 
-Sign in with `secret_path`, `username`, and `password` from that file. See `secret_path` in `ui_auth.json` for the path later. Use SSH forwarding for remote management. After an upgrade, check the stored `host` value for a legacy listener on all interfaces.
+Sign in with `secret_path`, `username`, and `password` from that file. See `secret_path` in `ui_auth.json` for the path later. Upgrades preserve the saved bind address and account.
 
 ### 2. Fetch and connect to a node
 

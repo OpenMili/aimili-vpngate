@@ -18,6 +18,7 @@ from pathlib import Path
 from unittest import mock
 
 import proxy_server
+import panel_access
 import release_utils
 from scripts import build_release_archives
 import snapshot_utils
@@ -880,8 +881,9 @@ class ManagerLogicTests(unittest.TestCase):
             output = Path(scratch)
             build_release_archives.build_installers(root, output, version)
             for name in ("install-source.sh", "install-docker.sh"):
-                url = f"https://github.com/OpenMili/aimili-vpngate/releases/latest/download/{name}"
-                self.assertIn(f"curl -fsSLO {url} && bash {name}", readme)
+                menu = (output / "install.sh").read_text(encoding="utf-8")
+                self.assertIn(hashlib.sha256((output / name).read_bytes()).hexdigest(), menu)
+                self.assertIn("releases/latest/download/install.sh -o aimili.sh", readme)
                 self.assertNotIn(b"\r", (output / name).read_bytes())
             source = (output / "install-source.sh").read_text(encoding="utf-8")
             docker = (output / "install-docker.sh").read_text(encoding="utf-8")
@@ -889,6 +891,22 @@ class ManagerLogicTests(unittest.TestCase):
             self.assertIn(f"image: ghcr.io/openmili/aimili-vpngate:{version}\n", docker)
             self.assertNotIn("    build:", docker)
             self.assertNotIn("@COMPOSE_YAML@", docker)
+
+    def test_real_listener_skips_busy_ports_and_keeps_selected_port(self) -> None:
+        with socket.socket() as occupied:
+            occupied.bind(("127.0.0.1", 0))
+            occupied.listen()
+            initial_port = occupied.getsockname()[1]
+            listener, selected = panel_access.bind_available(proxy_server.open_proxy_listener, "127.0.0.1", initial_port)
+            with listener:
+                self.assertNotEqual(selected, initial_port)
+                with socket.create_connection(("127.0.0.1", selected), timeout=1):
+                    pass
+
+    def test_display_preserves_loopback_and_formats_public_ipv6(self) -> None:
+        with mock.patch.dict(os.environ, {"AIMILIVPN_PUBLIC_HOST": "[2001:db8::1]"}):
+            self.assertEqual(panel_access.public_host("127.0.0.1"), "127.0.0.1")
+            self.assertEqual(panel_access.public_host("::"), "2001:db8::1")
 
     def test_release_package_verification_precedes_install(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
@@ -921,7 +939,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn('get_app_version()', install_text)
         self.assertNotIn("管理终端 v2.0", install_text)
         self.assertIn("getpass(", install_text)
-        self.assertIn("socket.create_connection", install_text)
+        self.assertIn('panel_access.py" health', install_text)
         self.assertIn("service_status", install_text)
         self.assertIn('chmod 600 "$AUTH_FILE"', install_text)
         self.assertIn("AIMILIVPN_NONINTERACTIVE", install_text)

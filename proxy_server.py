@@ -6,6 +6,7 @@ import re
 import os
 import secrets
 import select
+import errno
 import socket
 import threading
 import urllib.parse
@@ -418,67 +419,38 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
         except OSError:
             pass
 
-def start_proxy_server(host: str, port: int) -> None:
+def bind_proxy(host: str, port: int) -> socket.socket:
+    family = socket.AF_INET6 if ":" in host or host == "" else socket.AF_INET
+    server = socket.socket(family, socket.SOCK_STREAM)
     try:
-        get_proxy_credentials()
-    except ValueError as exc:
-        print(f"[ERROR] {exc}", flush=True)
-        return
-    is_ipv6 = ":" in host or host == ""
-    af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
-    server = None
-    try:
-        server = socket.socket(af, socket.SOCK_STREAM)
         server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        if is_ipv6:
+        if family == socket.AF_INET6:
             try:
                 server.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
             except OSError:
                 pass
         server.bind((host, port))
         server.listen(256)
-        print(f"HTTP/SOCKS5 proxy listening on {host}:{port}", flush=True)
-    except Exception as e:
-        if server is not None:
-            try:
-                server.close()
-            except Exception:
-                pass
-        if is_ipv6 and host in ("::", ""):
-            print(f"[警告] 绑定 IPv6 {host}:{port} 失败 ({e})，正在尝试回退至 IPv4 0.0.0.0 ...", flush=True)
-            try:
-                server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                server.bind(("0.0.0.0", port))
-                server.listen(256)
-                print(f"HTTP/SOCKS5 proxy listening on 0.0.0.0:{port} (仅 IPv4)", flush=True)
-            except Exception as ex:
-                import vpn_utils
-                diag = vpn_utils.diagnose_local_obstructions(port, host="0.0.0.0")
-                diag_msg = diag[1] if diag else str(ex)
-                print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on 0.0.0.0:{port}: {diag_msg}", flush=True)
-                return
-        elif is_ipv6 and host == "::1":
-            print(f"[警告] 绑定 IPv6 {host}:{port} 失败 ({e})，正在尝试回退至 IPv4 127.0.0.1 ...", flush=True)
-            try:
-                server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                server.bind(("127.0.0.1", port))
-                server.listen(256)
-                print(f"HTTP/SOCKS5 proxy listening on 127.0.0.1:{port} (仅 IPv4)", flush=True)
-            except Exception as ex:
-                import vpn_utils
-                diag = vpn_utils.diagnose_local_obstructions(port, host="127.0.0.1")
-                diag_msg = diag[1] if diag else str(ex)
-                print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on 127.0.0.1:{port}: {diag_msg}", flush=True)
-                return
-        else:
-            import vpn_utils
-            diag = vpn_utils.diagnose_local_obstructions(port, host=host)
-            diag_msg = diag[1] if diag else str(e)
-            print(f"[ERROR] Failed to start HTTP/SOCKS5 proxy on {host}:{port}: {diag_msg}", flush=True)
-            return
+        return server
+    except OSError:
+        server.close()
+        raise
 
+
+def open_proxy_listener(host: str, port: int) -> socket.socket:
+    try:
+        return bind_proxy(host, port)
+    except OSError as exc:
+        if exc.errno not in (errno.EAFNOSUPPORT, errno.EADDRNOTAVAIL) or host not in ("::", "::1", ""):
+            raise
+        return bind_proxy("127.0.0.1" if host == "::1" else "0.0.0.0", port)
+
+
+def start_proxy_server(host: str, port: int, server: socket.socket | None = None) -> None:
+    get_proxy_credentials()
+    if server is None:
+        server = open_proxy_listener(host, port)
+    print(f"HTTP/SOCKS5 proxy listening on {host}:{port}", flush=True)
     while True:
         try:
             client, address = server.accept()
