@@ -4,8 +4,8 @@
 
 **A VPNGate node manager and HTTP / HTTPS / SOCKS5 proxy gateway for Linux VPS hosts**
 
-[![Release](https://img.shields.io/github/v/release/baoweise-bot/aimili-vpngate?style=flat-square&label=stable&color=16a34a)](https://github.com/baoweise-bot/aimili-vpngate/releases/latest)
-[![Docker](https://img.shields.io/badge/Docker-amd64%20%7C%20386%20%7C%20arm64%20%7C%20armv7-0ea5e9?style=flat-square&logo=docker&logoColor=white)](https://github.com/baoweise-bot/aimili-vpngate/pkgs/container/aimili-vpngate)
+[![Release](https://img.shields.io/github/v/release/OpenMili/aimili-vpngate?style=flat-square&label=stable&color=16a34a)](https://github.com/OpenMili/aimili-vpngate/releases/latest)
+[![Docker](https://img.shields.io/badge/Docker-amd64%20%7C%20386%20%7C%20arm64%20%7C%20armv7-0ea5e9?style=flat-square&logo=docker&logoColor=white)](https://github.com/OpenMili/aimili-vpngate/pkgs/container/aimili-vpngate)
 [![License](https://img.shields.io/badge/License-GPL--3.0-334155?style=flat-square)](../LICENSE)
 
 [简体中文](../README.md) · **English** · [日本語](README.ja.md) · [한국어](README.ko.md)
@@ -26,7 +26,7 @@ AimiliVPN uses Python's standard library to manage VPNGate nodes. It provides no
 | Local proxy | `127.0.0.1:7928`, HTTP, HTTPS `CONNECT`, and SOCKS5 |
 | Source deployment | x64, x86, ARM64, and ARM32 Linux |
 | Docker images | `linux/amd64`, `linux/386`, `linux/arm64`, and `linux/arm/v7` |
-| Update channel | GitHub `main` stable branch / latest stable Release |
+| Update channel | SHA-256 verified GitHub Release |
 
 > [!IMPORTANT]
 > **Network availability:** Some regions, data centers, and network providers may restrict DNS, VPNGate APIs, GitHub mirrors, or VPN protocols. Mirrors and local snapshots improve node-list availability but cannot guarantee a successful connection on every host. Confirm that local law and your VPS provider permit VPN/TUN before deployment.
@@ -34,13 +34,7 @@ AimiliVPN uses Python's standard library to manage VPNGate nodes. It provides no
 <a id="quick-install"></a>
 ## Quick Install
 
-Run as `root` on a supported Linux VPS:
-
-```bash
-bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
-```
-
-The installer prints the complete Web URL, private path, username, and password. Run `ml` to open the management menu.
+Use the [source Release installation steps](#source-release) on a supported Linux VPS. Run the installer as root. The terminal displays the local Web address and initial login credentials.
 
 > [!TIP]
 > Enable TUN/TAP in the VPS control panel and verify that `/dev/net/tun` exists. The Web dashboard uses TCP `8787` by default; restrict firewall access to your own IP whenever possible.
@@ -67,19 +61,19 @@ Before purchasing, confirm that the selected plan permits TUN/TAP, OpenVPN, and 
 - `root`, OpenVPN, iptables, policy routing, and TUN/TAP.
 - Windows and macOS can be proxy clients, but cannot run the full gateway. Docker Desktop is not equivalent to a Linux VPS with host TUN access.
 
+<a id="source-release"></a>
 ### Option 1: Source installer
 
-```bash
-bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
-```
-
-The installer deploys to `/opt/aimilivpn` and registers a system service.
-
-For unattended installation, explicitly skip the first-run prompts and generate the Web path and credentials automatically:
+Download a source archive with the updated installer and its `sha256sums.txt` from the same [GitHub Release](https://github.com/OpenMili/aimili-vpngate/releases). Verify it as root in a directory containing only these two files. Trust the download source before first installation.
 
 ```bash
-AIMILIVPN_NONINTERACTIVE=1 bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
+sha256sum -c sha256sums.txt && \
+  tar -xzf aimilivpn-vX.Y.Z-linux-source.tar.gz && \
+  cd aimilivpn-vX.Y.Z-linux-source && \
+  bash install.sh
 ```
+
+The installer deploys to `/opt/aimilivpn` and registers the system service. It requires Python 3.9 or newer. Run `AIMILIVPN_NONINTERACTIVE=1 bash install.sh` to generate the initial credentials automatically. Upgrades preserve the management configuration.
 
 ```bash
 ml                 # Open the management menu
@@ -87,33 +81,26 @@ ml status          # Show status, Web URL, and username
 ml logs            # Follow logs
 ml restart         # Restart the service
 ml password        # Reset Web credentials
-ml update          # Update from the stable main branch
+ml update          # Verify and install the latest formal Release
+ml update vX.Y.Z   # Install a specific Release
 ml uninstall       # Uninstall
 ```
 
-To inspect the installer first:
-
-```bash
-git clone --branch main --single-branch https://github.com/baoweise-bot/aimili-vpngate.git
-cd aimili-vpngate
-sudo bash install.sh
-```
-
-Universal Linux source archives and SHA-256 checksums are available from [GitHub Releases](https://github.com/baoweise-bot/aimili-vpngate/releases/latest). Version changes are documented in the Release Notes.
+For development, run `sudo bash install.sh --local-dev` from a reviewed checkout. Manage updates manually in local development mode.
 
 ### Option 2: Docker Compose
 
 The Docker host must provide `/dev/net/tun`, host networking, `NET_ADMIN`, and `NET_RAW`.
 
 ```bash
-git clone --branch main --single-branch https://github.com/baoweise-bot/aimili-vpngate.git
+git clone --branch main --single-branch https://github.com/OpenMili/aimili-vpngate.git
 cd aimili-vpngate
 docker compose pull
 docker compose up -d
 docker logs -f aimilivpn
 ```
 
-Image: `ghcr.io/baoweise-bot/aimili-vpngate:2.1`
+Image: `ghcr.io/openmili/aimili-vpngate:2.1`
 
 Update:
 
@@ -133,12 +120,12 @@ docker run -d \
   --cap-add NET_ADMIN \
   --cap-add NET_RAW \
   --device /dev/net/tun:/dev/net/tun \
-  -e UI_HOST=0.0.0.0 \
+  -e UI_HOST=127.0.0.1 \
   -e UI_PORT=8787 \
   -e LOCAL_PROXY_HOST=127.0.0.1 \
   -e LOCAL_PROXY_PORT=7928 \
   -v aimilivpn-data:/data \
-  ghcr.io/baoweise-bot/aimili-vpngate:2.1
+  ghcr.io/openmili/aimili-vpngate:2.1
 ```
 
 </details>
@@ -147,7 +134,7 @@ docker run -d \
 <summary><strong>Build locally when GHCR is unavailable</strong></summary>
 
 ```bash
-git clone --branch main --single-branch https://github.com/baoweise-bot/aimili-vpngate.git
+git clone --branch main --single-branch https://github.com/OpenMili/aimili-vpngate.git
 cd aimili-vpngate
 docker compose build
 docker compose up -d
@@ -163,18 +150,18 @@ docker compose up -d
 For a source installation, open the URL printed by the installer:
 
 ```text
-http://VPS_IP:8787/private_path/
+http://127.0.0.1:8787/private_path/
 ```
 
 Run `ml status` to recover the URL, or `ml password` to reset credentials.
 
-Docker users can read the initial Web configuration with:
+The Web password hash is stored in `ui_auth.json`. Docker writes the first-login credentials to a file readable only by the container administrator and removes it after successful login.
 
 ```bash
-docker exec aimilivpn cat /data/ui_auth.json
+docker exec aimilivpn cat /data/ui_bootstrap.json
 ```
 
-Use its `secret_path`, `username`, and `password`, then change them after the first sign-in.
+Sign in with `secret_path`, `username`, and `password` from that file. See `secret_path` in `ui_auth.json` for the path later. Use SSH forwarding for remote management. After an upgrade, check the stored `host` value for a legacy listener on all interfaces.
 
 ### 2. Fetch and connect to a node
 
@@ -224,7 +211,7 @@ After the tunnel is established:
 | Website / forum | Announcements and discussion | [339936.xyz](https://339936.xyz) |
 | Telegram group | Real-time community chat | [t.me/arestemple](https://t.me/arestemple) |
 | YouTube tutorial | Installation and usage video | [Watch](https://www.youtube.com/watch?v=s-ATfXR8BpI) |
-| GitHub Issues | Reproducible bugs and feature requests | [Open an issue](https://github.com/baoweise-bot/aimili-vpngate/issues) |
+| GitHub Issues | Reproducible bugs and feature requests | [Open an issue](https://github.com/OpenMili/aimili-vpngate/issues) |
 | Email | Bug reports and contact | [yaohunse7@gmail.com](mailto:yaohunse7@gmail.com) |
 
 <a id="legal"></a>
@@ -242,6 +229,6 @@ After the tunnel is established:
 
 <div align="center">
 
-[Stable Release](https://github.com/baoweise-bot/aimili-vpngate/releases/latest) · [Issues](https://github.com/baoweise-bot/aimili-vpngate/issues) · [GPL-3.0 License](../LICENSE)
+[Stable Release](https://github.com/OpenMili/aimili-vpngate/releases/latest) · [Issues](https://github.com/OpenMili/aimili-vpngate/issues) · [GPL-3.0 License](../LICENSE)
 
 </div>

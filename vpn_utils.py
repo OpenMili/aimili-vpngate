@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import json
+import tempfile
 import os
 import re
 import socket
@@ -15,11 +16,14 @@ from typing import Any
 
 ROOT_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPNGATE_DATA_DIR") else ROOT_DIR / "vpngate_data"
+from snapshot_utils import valid_remote_host
+
 IP_CACHE_FILE = DATA_DIR / "ip_cache.json"
 IP_CLASSIFICATION_VERSION = 4
 IP_CACHE_TTL_SECONDS = 7 * 24 * 3600
 
 ip_cache_lock = threading.RLock()
+enrichment_stop_event = threading.Event()
 physical_interface_lock = threading.Lock()
 physical_interface_cache: tuple[str | None, float] = (None, 0.0)
 
@@ -279,11 +283,13 @@ def tcp_latency_ms(host: str, port: int, dev: str | None = None) -> int:
                 pass
 
 def ping_latency_ms(host: str, port: int, fallback_ping: int = 0) -> int:
+    if not valid_remote_host(host):
+        return max(0, fallback_ping)
     dev = get_physical_interface()
     # 1. Try ping with interface binding
     if dev:
         try:
-            cmd = ["ping", "-c", "1", "-W", "2", "-I", dev, host]
+            cmd = ["ping", "-c", "1", "-W", "2", "-I", dev, "--", host]
             res = subprocess.run(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -302,7 +308,7 @@ def ping_latency_ms(host: str, port: int, fallback_ping: int = 0) -> int:
 
     # 2. Try ping without interface binding
     try:
-        cmd = ["ping", "-c", "1", "-W", "2", host]
+        cmd = ["ping", "-c", "1", "-W", "2", "--", host]
         res = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
@@ -341,6 +347,10 @@ def check_and_fix_dns() -> None:
     except (socket.gaierror, OSError):
         pass
 
+    if os.environ.get("VPNGATE_AUTO_FIX_DNS") != "1":
+        print("[DNS] 无法解析 VPN Gate 域名，请检查系统解析器配置。", flush=True)
+        return
+
     network_ok = False
     # Test IPv4 DNS servers first, then IPv6
     dns_targets = [
@@ -352,7 +362,7 @@ def check_and_fix_dns() -> None:
     for ip, port, af in dns_targets:
         s = None
         try:
-            s = socket.socket(af, socket.SOCK_DGRAM)
+            s = socket.socket(af, socket.SOCK_STREAM)
             s.settimeout(2)
             s.connect((ip, port))
             network_ok = True
@@ -393,7 +403,20 @@ def save_ip_cache(cache: dict[str, dict[str, Any]]) -> None:
     with ip_cache_lock:
         try:
             DATA_DIR.mkdir(exist_ok=True, parents=True)
-            IP_CACHE_FILE.write_text(json.dumps(cache, ensure_ascii=False, indent=2), encoding="utf-8")
+            now = time.time()
+            cache = {
+                ip: entry for ip, entry in cache.items()
+                if isinstance(entry, dict) and isinstance(entry.get("cached_at"), (int, float))
+                and 0 <= now - entry["cached_at"] < IP_CACHE_TTL_SECONDS
+            }
+            fd, filename = tempfile.mkstemp(prefix=".ip-cache.", dir=DATA_DIR)
+            tmp = Path(filename)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(cache, f, ensure_ascii=False, indent=2)
+                tmp.replace(IP_CACHE_FILE)
+            finally:
+                tmp.unlink(missing_ok=True)
         except Exception:
             pass
 
@@ -425,6 +448,8 @@ def classification_confidence(reason: str) -> str:
     return "low"
 
 def query_secondary_ip_type(ip: str) -> dict[str, Any] | None:
+    if enrichment_stop_event.is_set():
+        return None
     request = urllib.request.Request(
         f"https://api.ipapi.is/?q={urllib.parse.quote(ip)}",
         headers={"User-Agent": f"AimiliVPN-IP-Classifier/{IP_CLASSIFICATION_VERSION}"},
@@ -477,7 +502,9 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
         if (
             cache_entry
             and cache_entry.get("classification_version") == IP_CLASSIFICATION_VERSION
-            and now - cache_entry.get("cached_at", 0) < IP_CACHE_TTL_SECONDS
+            and 0 <= now - cache_entry.get("cached_at", 0) < (
+                300 if cache_entry.get("ip_type") == "unknown" else IP_CACHE_TTL_SECONDS
+            )
         ):
             cached = cache[ip]
             apply_ip_cache_entry(node, cached)
@@ -491,11 +518,12 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
     # 2. Perform HTTP query outside lock
     new_entries = {}
     chunk_size = 100
-    for i in range(0, len(ips_to_query), chunk_size):
+    batch_url = os.environ.get("VPNGATE_IP_BATCH_URL", "").strip()
+    for i in range(0, len(ips_to_query) if batch_url.startswith("https://") else 0, chunk_size):
         chunk = ips_to_query[i : i + chunk_size]
         payload = json.dumps(chunk).encode("utf-8")
         request = urllib.request.Request(
-            "http://ip-api.com/batch?lang=zh-CN&fields=status,message,query,country,countryCode,regionName,city,isp,org,as,asname,proxy,hosting,mobile",
+            batch_url,
             data=payload,
             headers={
                 "Content-Type": "application/json",
@@ -514,7 +542,7 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
                     if item.get("status") != "success":
                         continue
                     query_ip = item.get("query")
-                    if not query_ip:
+                    if query_ip not in chunk:
                         continue
 
                     ip_type, ip_type_reason = classify_ip_type(item)
@@ -549,6 +577,12 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
         except Exception as e:
             print(f"[enrich_ip_info] Query failed: {e}", flush=True)
 
+    for ip in ips_to_query:
+        new_entries.setdefault(ip, {
+            "ip_type": "unknown", "ip_type_reason": "missing_provider_data",
+            "ip_type_confidence": "low", "ip_type_sources": [],
+            "classification_version": IP_CLASSIFICATION_VERSION, "cached_at": now,
+        })
     ambiguous_ips = [
         ip
         for ip, entry in new_entries.items()
@@ -578,6 +612,17 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
                     entry["ip_type_confidence"] = "low"
                     continue
                 entry["ip_type_sources"].append("ipapi.is")
+                if len(entry["ip_type_sources"]) == 1:
+                    company = secondary.get("company") or {}
+                    asn = secondary.get("asn") or {}
+                    location = secondary.get("location") or {}
+                    entry.update(
+                        owner=company.get("name", ""), asn=asn.get("asn", ""), as_name=asn.get("descr", ""),
+                        location=" ".join(str(location[key]) for key in ("country", "state", "city") if location.get(key)),
+                        geo_country_short=str(location.get("country_code") or "").upper(),
+                        is_proxy=bool(secondary.get("is_proxy") or secondary.get("is_vpn")),
+                        is_hosting=False, is_mobile=False, quality="normal",
+                    )
                 if secondary.get("is_mobile"):
                     entry["ip_type"] = "mobile"
                     entry["ip_type_reason"] = "secondary_mobile"

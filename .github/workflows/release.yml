@@ -7,9 +7,8 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing formal tag to publish, for example v2.1.5
+        description: Existing formal tag to publish (vX.Y.Z)
         required: true
-        default: v2.1.5
         type: string
 
 concurrency:
@@ -17,8 +16,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
 
 env:
   RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
@@ -32,17 +30,18 @@ jobs:
       matrix:
         python-version: ["3.9", "3.11", "3.13"]
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          persist-credentials: false
           ref: ${{ env.RELEASE_TAG }}
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: ${{ matrix.python-version }}
       - name: Verify formal version tag
         shell: bash
         run: test "${RELEASE_TAG}" = "v$(tr -d '\r\n' < VERSION)"
       - name: Compile Python sources
-        run: python -m py_compile vpngate_manager.py vpn_utils.py proxy_server.py snapshot_utils.py
+        run: python -m py_compile *.py scripts/*.py
       - name: Validate installation script
         run: bash -n install.sh
       - name: Validate Docker Compose configuration
@@ -67,13 +66,14 @@ jobs:
           - platform: linux/arm/v7
             slug: armv7
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          persist-credentials: false
           ref: ${{ env.RELEASE_TAG }}
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
       - name: Build architecture image for smoke test
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           load: true
@@ -82,24 +82,31 @@ jobs:
           tags: aimilivpn-smoke:${{ matrix.slug }}
           cache-from: type=gha,scope=smoke-${{ matrix.slug }}
           cache-to: type=gha,mode=max,scope=smoke-${{ matrix.slug }}
-      - name: Verify application imports in image
+      - name: Verify proxy health-check dependency and application imports
         shell: bash
         run: |
           docker run --rm --platform "${{ matrix.platform }}" \
-            "aimilivpn-smoke:${{ matrix.slug }}" \
-            python3 -c 'import vpngate_manager as app; print(app.APP_VERSION)'
+            "aimilivpn-smoke:${{ matrix.slug }}" sh -ec '
+              command -v curl
+              command -v ping
+              python3 -c "import vpngate_manager as app; print(app.APP_VERSION)"
+            '
 
   docker:
     name: Publish multi-architecture Docker image
+    permissions:
+      contents: read
+      packages: write
     needs: docker-smoke
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          persist-credentials: false
           ref: ${{ env.RELEASE_TAG }}
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -112,17 +119,18 @@ jobs:
           minor="$(printf '%s' "${version}" | cut -d. -f1,2)"
           echo "version=${version}" >> "${GITHUB_OUTPUT}"
           echo "minor=${minor}" >> "${GITHUB_OUTPUT}"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "${GITHUB_OUTPUT}"
       - name: Build and publish Docker manifest
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
         with:
           context: .
           push: true
           platforms: linux/amd64,linux/386,linux/arm64,linux/arm/v7
           build-args: BUILD_VERSION=${{ steps.version.outputs.version }}
           tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.version }}
-            ghcr.io/${{ github.repository }}:${{ steps.version.outputs.minor }}
-            ghcr.io/${{ github.repository }}:latest
+            ${{ steps.version.outputs.image }}:${{ steps.version.outputs.version }}
+            ${{ steps.version.outputs.image }}:${{ steps.version.outputs.minor }}
+            ${{ steps.version.outputs.image }}:latest
           cache-from: type=gha
           cache-to: type=gha,mode=max
           provenance: mode=max
@@ -130,13 +138,16 @@ jobs:
 
   release:
     name: Publish universal Python source release
+    permissions:
+      contents: write
     needs: docker
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          persist-credentials: false
           ref: ${{ env.RELEASE_TAG }}
-      - uses: actions/setup-python@v7
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
         with:
           python-version: "3.11"
       - name: Build universal Linux source archive
@@ -151,5 +162,5 @@ jobs:
             gh release upload "${RELEASE_TAG}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
             gh release edit "${RELEASE_TAG}" --repo "${GITHUB_REPOSITORY}" --title "${title}" --notes-file RELEASE_NOTES.md
           else
-            gh release create "${RELEASE_TAG}" dist/* --repo "${GITHUB_REPOSITORY}" --title "${title}" --notes-file RELEASE_NOTES.md --verify-tag
+            gh release create "${RELEASE_TAG}" dist/* --repo "${GITHUB_REPOSITORY}" --title "${title}" --notes-file RELEASE_NOTES.md --verify-tag --latest
           fi

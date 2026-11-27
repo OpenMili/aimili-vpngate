@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import base64
+import ipaddress
+import re
 import os
 import secrets
 import select
@@ -8,7 +10,8 @@ import socket
 import threading
 import urllib.parse
 import time
-from typing import Any
+
+from snapshot_utils import valid_remote_host
 
 def parse_positive_int(value: str | None, default: int) -> int:
     try:
@@ -18,12 +21,6 @@ def parse_positive_int(value: str | None, default: int) -> int:
 
 MAX_PROXY_CONNECTIONS = parse_positive_int(os.environ.get("LOCAL_PROXY_MAX_CONNECTIONS"), 256)
 proxy_connection_sem = threading.BoundedSemaphore(MAX_PROXY_CONNECTIONS)
-
-def parse_int(value: Any) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
 
 def recv_exact(sock: socket.socket, size: int) -> bytes:
     data = b""
@@ -36,25 +33,33 @@ def recv_exact(sock: socket.socket, size: int) -> bytes:
 
 def parse_host_port(authority: str, default_port: int) -> tuple[str, int]:
     authority = authority.strip()
+    port = default_port
     if authority.startswith("["):
-        host_part, sep, rest = authority.partition("]")
-        host = host_part.lstrip("[")
-        port = default_port
-        if sep and rest.startswith(":"):
-            port_text = rest[1:]
-            port = parse_int(port_text) or default_port
-        return host, port
-    if authority.count(":") == 1:
-        host, _, port_text = authority.rpartition(":")
-        return host, parse_int(port_text) or default_port
-    return authority, default_port
+        host, sep, suffix = authority[1:].partition("]")
+        if not sep or (suffix and not suffix.startswith(":")):
+            raise ValueError("Invalid IPv6 authority")
+        ipaddress.IPv6Address(host)
+        port_text = suffix[1:] if suffix else None
+    elif authority.count(":") == 1:
+        host, _, port_text = authority.partition(":")
+    else:
+        host, port_text = authority, None
+    if port_text is not None:
+        if not re.fullmatch(r"[0-9]{1,5}", port_text, re.ASCII):
+            raise ValueError("Invalid destination port")
+        port = int(port_text)
+    if not 1 <= port <= 65535 or not valid_remote_host(host):
+        raise ValueError("Invalid destination address")
+    return host, port
 
 def get_proxy_credentials() -> tuple[str | None, str | None]:
     user = os.environ.get("LOCAL_PROXY_USER") or os.environ.get("LOCAL_PROXY_USERNAME")
     password = os.environ.get("LOCAL_PROXY_PASS") or os.environ.get("LOCAL_PROXY_PASSWORD")
     if user is None and password is None:
         return None, None
-    return user or "", password or ""
+    if not user or not password:
+        raise ValueError("Configure both LOCAL_PROXY_USER and LOCAL_PROXY_PASS")
+    return user, password
 
 def proxy_auth_enabled() -> bool:
     user, password = get_proxy_credentials()
@@ -82,123 +87,118 @@ def check_credentials(username: str | None, password: str | None) -> bool:
     expected_user, expected_pass = get_proxy_credentials()
     if expected_user is None or expected_pass is None:
         return True
-    return secrets.compare_digest(username or "", expected_user) and secrets.compare_digest(password or "", expected_pass)
+    if username is None or password is None:
+        return False
+    return secrets.compare_digest(username.encode(), expected_user.encode()) and secrets.compare_digest(password.encode(), expected_pass.encode())
+
+def dns_read_name(packet: bytes, offset: int) -> tuple[bytes, int]:
+    labels = []
+    resume = None
+    for _ in range(128):
+        length = packet[offset]
+        if length == 0:
+            return b".".join(labels).lower(), resume if resume is not None else offset + 1
+        if length & 0xC0 == 0xC0:
+            pointer = ((length & 0x3F) << 8) | packet[offset + 1]
+            if pointer >= offset:
+                raise ValueError("Invalid DNS compression pointer")
+            if resume is None:
+                resume = offset + 2
+            offset = pointer
+            continue
+        if length > 63 or offset + length + 1 > len(packet):
+            raise ValueError("Invalid DNS label")
+        offset += 1
+        labels.append(packet[offset:offset + length])
+        offset += length
+    raise ValueError("DNS name is too long")
+
 
 def dns_query_over_tun0(host: str, qtype: int, dns_server: str, timeout: float) -> str | None:
-    import random
-    sock = None
     try:
-        tx_id = random.getrandbits(16).to_bytes(2, "big")
-        flags = b"\x01\x00"
-        questions = b"\x00\x01"
-        rrs = b"\x00\x00\x00\x00\x00\x00"
-
-        qname = b""
-        for part in host.split("."):
-            if not part:
-                continue
-            part_bytes = part.encode("idna")
-            if len(part_bytes) > 63:
-                return None
-            qname += len(part_bytes).to_bytes(1, "big") + part_bytes
-        qname += b"\x00"
-
-        qtype_qclass = qtype.to_bytes(2, "big") + b"\x00\x01"
-        packet = tx_id + flags + questions + rrs + qname + qtype_qclass
-
-        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(timeout)
-        try:
+        dns_ip = ipaddress.ip_address(dns_server)
+        hostname = host.rstrip(".").encode("idna").lower()
+        if not valid_remote_host(hostname.decode("ascii")):
+            return None
+        qname = b"".join(bytes([len(label)]) + label for label in hostname.split(b".")) + b"\x00"
+        tx_id = secrets.token_bytes(2)
+        question = qname + qtype.to_bytes(2, "big") + b"\x00\x01"
+        packet = tx_id + b"\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00" + question
+        family = socket.AF_INET if dns_ip.version == 4 else socket.AF_INET6
+        with socket.socket(family, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BINDTODEVICE, b"tun0")
-        except OSError as e:
-            if "operation not permitted" in str(e).lower() or e.errno == 1:
-                print("[DNS 绑定失败] [错误代码 3006] DNS 解析绑定 tun0 权限不足，请确保程序以 root 权限运行！", flush=True)
-            elif "no such device" in str(e).lower() or e.errno == 19:
-                print("[DNS 绑定失败] [错误代码 3004] DNS 解析绑定 tun0 失败，网卡设备不存在，请检查 VPN 连接！", flush=True)
+            # A connected UDP socket only receives from the configured peer.
+            sock.connect((str(dns_ip), 53))
+            sock.send(packet)
+            resp = sock.recv(4096)
+        if len(resp) < 12 or resp[:2] != tx_id or resp[4:6] != b"\x00\x01":
             return None
-        sock.sendto(packet, (dns_server, 53))
-        resp, _ = sock.recvfrom(4096)
-    except Exception:
-        return None
-    finally:
-        if sock is not None:
-            try:
-                sock.close()
-            except Exception:
-                pass
-
-    try:
-        if len(resp) < 12 or resp[:2] != tx_id:
+        flags = int.from_bytes(resp[2:4], "big")
+        if not flags & 0x8000 or flags & 0x7A0F:  # QR, standard response, untruncated, successful
             return None
-        rcode = resp[3] & 0x0F
-        if rcode != 0:
+        name, offset = dns_read_name(resp, 12)
+        if name != hostname or resp[offset:offset + 4] != question[-4:]:
             return None
-
-        offset = 12
-        while offset < len(resp):
-            length = resp[offset]
-            if length == 0:
-                offset += 1
-                break
-            if (length & 0xC0) == 0xC0:
-                offset += 2
-                break
-            offset += 1 + length
-
         offset += 4
-        answers_count = int.from_bytes(resp[6:8], "big")
-        for _ in range(answers_count):
-            if offset >= len(resp):
-                break
-            while offset < len(resp):
-                length = resp[offset]
-                if length == 0:
-                    offset += 1
-                    break
-                if (length & 0xC0) == 0xC0:
-                    offset += 2
-                    break
-                offset += 1 + length
-            if offset + 10 > len(resp):
-                break
-            atype = int.from_bytes(resp[offset : offset + 2], "big")
-            aclass = int.from_bytes(resp[offset + 2 : offset + 4], "big")
-            rdlength = int.from_bytes(resp[offset + 8 : offset + 10], "big")
+        addresses = {}
+        aliases = {}
+        for _ in range(int.from_bytes(resp[6:8], "big")):
+            name, offset = dns_read_name(resp, offset)
+            header = resp[offset:offset + 10]
+            if len(header) != 10:
+                return None
+            answer_type = int.from_bytes(header[:2], "big")
+            length = int.from_bytes(header[8:], "big")
             offset += 10
-            if offset + rdlength > len(resp):
+            end = offset + length
+            if end > len(resp):
+                return None
+            if header[2:4] == b"\x00\x01":
+                if answer_type == qtype and length == (4 if qtype == 1 else 16):
+                    addresses.setdefault(name, str(ipaddress.ip_address(resp[offset:end])))
+                elif answer_type == 5:
+                    alias, after_name = dns_read_name(resp, offset)
+                    if after_name == end:
+                        aliases[name] = alias
+            offset = end
+        name = hostname
+        seen = set()
+        while name not in seen:
+            if name in addresses:
+                return addresses[name]
+            if name not in aliases:
                 break
-            record = resp[offset : offset + rdlength]
-            if atype == qtype and aclass == 1:
-                if qtype == 1 and rdlength == 4:
-                    return socket.inet_ntoa(record)
-                if qtype == 28 and rdlength == 16:
-                    return socket.inet_ntop(socket.AF_INET6, record)
-            offset += rdlength
-    except Exception:
+            seen.add(name)
+            name = aliases[name]
+    except (OSError, ValueError, IndexError, AttributeError):
         return None
     return None
 
-def resolve_dns_over_tun0(host: str, dns_server: str = "8.8.8.8", timeout: float = 3.0) -> str | None:
+
+def resolve_dns_over_tun0(host: str, dns_server: str | None = None, timeout: float = 1.5) -> str | None:
     try:
-        socket.inet_aton(host)
-        return host
-    except OSError:
+        return str(ipaddress.ip_address(host)) if "%" not in host else None
+    except ValueError:
         pass
-    try:
-        socket.inet_pton(socket.AF_INET6, host)
-        return host
-    except OSError:
-        pass
-    return dns_query_over_tun0(host, 1, dns_server, timeout) or dns_query_over_tun0(host, 28, dns_server, timeout)
+    servers = dns_server or os.environ.get("VPNGATE_TUN_DNS", "8.8.8.8,1.1.1.1")
+    for server in servers.split(",")[:3]:
+        for qtype in (1, 28):
+            result = dns_query_over_tun0(host, qtype, server.strip(), timeout)
+            if result:
+                return result
+    return None
 
 def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.socket:
     host, port = address
+    if not 1 <= port <= 65535:
+        raise ValueError("Invalid destination port")
     resolved_ip = resolve_dns_over_tun0(host)
-    if resolved_ip:
-        host = resolved_ip
+    if not resolved_ip:
+        raise OSError("DNS resolution through tun0 failed")
 
     err = None
-    for res in socket.getaddrinfo(host, port, 0, socket.SOCK_STREAM):
+    for res in socket.getaddrinfo(resolved_ip, port, 0, socket.SOCK_STREAM, 0, socket.AI_NUMERICHOST):
         af, socktype, proto, canonname, sa = res
         sock = None
         try:
@@ -222,7 +222,7 @@ def create_connection(address: tuple[str, int], timeout: float = 20) -> socket.s
 
 def relay(left: socket.socket, right: socket.socket) -> None:
     sockets = [left, right]
-    while True:
+    while sockets:
         readable, _, errored = select.select(sockets, [], sockets, 120)
         if errored or not readable:
             return
@@ -230,8 +230,13 @@ def relay(left: socket.socket, right: socket.socket) -> None:
             target = right if source is left else left
             data = source.recv(65536)
             if not data:
-                return
-            target.sendall(data)
+                sockets.remove(source)
+                try:
+                    target.shutdown(socket.SHUT_WR)
+                except OSError:
+                    pass
+            else:
+                target.sendall(data)
 
 def socks5_client(client: socket.socket, first_byte: bytes) -> None:
     upstream = None
@@ -297,33 +302,38 @@ def read_http_header(client: socket.socket, first_byte: bytes) -> bytes:
         data += chunk
     return data
 
+HTTP_TOKEN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+\Z", re.ASCII)
+_HTTP_BAD_REQUEST = b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+
+
 def http_client(client: socket.socket, first_byte: bytes) -> None:
     upstream = None
     try:
-        header = read_http_header(client, first_byte)
-        if b"\r\n\r\n" not in header:
-            client.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
+        raw = read_http_header(client, first_byte)
+        head, delimiter, rest = raw.partition(b"\r\n\r\n")
+        if not delimiter or len(head) > 65536:
+            raise ValueError("Incomplete HTTP headers")
+        lines = head.decode("iso-8859-1").split("\r\n")
+        method, target, version = lines[0].split(" ")
+        if not HTTP_TOKEN.fullmatch(method) or not target or re.search(r"[\x00-\x20\x7f]", target):
+            raise ValueError("Invalid HTTP request line")
+        if version not in {"HTTP/1.0", "HTTP/1.1"}:
+            raise ValueError("Unsupported HTTP version")
+        headers: dict[str, list[str]] = {}
+        for line in lines[1:]:
+            key, sep, value = line.partition(":")
+            if not sep or not HTTP_TOKEN.fullmatch(key) or re.search(r"[\x00-\x08\x0a-\x1f\x7f]", value):
+                raise ValueError("Invalid HTTP header")
+            headers.setdefault(key.lower(), []).append(value.strip(" \t"))
+
+        if proxy_auth_enabled() and not check_credentials(*parse_http_basic_auth(lines[1:])):
+            client.sendall(
+                b"HTTP/1.1 407 Proxy Authentication Required\r\n"
+                b'Proxy-Authenticate: Basic realm="AimiliVPN Proxy"\r\n'
+                b"Content-Length: 0\r\n\r\n"
+            )
             return
-        head, rest = header.split(b"\r\n\r\n", 1)
-        lines = head.decode("iso-8859-1", errors="replace").split("\r\n")
-        try:
-            method, target, version = lines[0].split(" ", 2)
-        except ValueError:
-            client.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
-            return
-        if not version.startswith("HTTP/"):
-            client.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
-            return
-        if proxy_auth_enabled():
-            username, password = parse_http_basic_auth(lines[1:])
-            if not check_credentials(username, password):
-                client.sendall(
-                    b"HTTP/1.1 407 Proxy Authentication Required\r\n"
-                    b"Proxy-Authenticate: Basic realm=\"AimiliVPN Proxy\"\r\n"
-                    b"Content-Length: 0\r\n\r\n"
-                )
-                return
-        if method.upper() == "CONNECT":
+        if method == "CONNECT":
             host, port = parse_host_port(target, 443)
             upstream = create_connection((host, port), timeout=20)
             client.sendall(b"HTTP/1.1 200 Connection Established\r\n\r\n")
@@ -332,43 +342,56 @@ def http_client(client: socket.socket, first_byte: bytes) -> None:
             relay(client, upstream)
             return
 
-        try:
-            parsed = urllib.parse.urlsplit(target)
-        except ValueError:
-            client.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
-            return
-        hostname = parsed.hostname
-        port = parsed.port
-        scheme = parsed.scheme
-        if not hostname:
-            # Fallback to Host header
-            for line in lines[1:]:
-                if line.lower().startswith("host:"):
-                    host_val = line.split(":", 1)[1].strip()
-                    if "[" in host_val and "]" in host_val:
-                        host_part, _, port_part = host_val.rpartition("]")
-                        hostname = host_part.lstrip("[")
-                        if port_part.startswith(":"):
-                            p_val = port_part.lstrip(":")
-                            port = int(p_val) if p_val.isdigit() else None
-                        else:
-                            port = None
-                    else:
-                        hostname, parsed_port = parse_host_port(host_val, 0)
-                        port = parsed_port or None
-                    break
-        if not hostname:
-            client.sendall(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n")
-            return
-        port = port or (443 if scheme == "https" else 80)
+        parsed = urllib.parse.urlsplit(target)
+        if parsed.scheme == "http" and parsed.netloc and parsed.username is None:
+            host, port = parse_host_port(parsed.netloc, 80)
+        elif target.startswith("/") and not parsed.netloc and len(headers.get("host", [])) == 1:
+            host, port = parse_host_port(headers["host"][0], 80)
+        else:
+            raise ValueError("Invalid HTTP destination")
+        if parsed.fragment or "transfer-encoding" in headers:
+            raise ValueError("Unsupported HTTP framing")
+        lengths = headers.get("content-length", ["0"])
+        if len(lengths) != 1 or not re.fullmatch(r"[0-9]{1,12}", lengths[0], re.ASCII):
+            raise ValueError("Invalid HTTP content length")
+        length = int(lengths[0])
+        if len(rest) > length:
+            raise ValueError("Unexpected HTTP request data")
+
+        connection_options = {
+            item.strip().lower()
+            for value in headers.get("connection", [])
+            for item in value.split(",")
+        }
+        skip = connection_options | {
+            "host", "connection", "proxy-connection", "proxy-authorization", "proxy-authenticate",
+            "keep-alive", "te", "trailer", "upgrade", "expect", "content-length",
+        }
         path = urllib.parse.urlunsplit(("", "", parsed.path or "/", parsed.query, ""))
-        headers = [line for line in lines[1:] if not line.lower().startswith(("proxy-connection:", "connection:", "proxy-authorization:"))]
-        request = f"{method} {path} {version}\r\n" + "\r\n".join(headers) + "\r\nConnection: close\r\n\r\n"
-        upstream = create_connection((hostname, port), timeout=20)
-        upstream.sendall(request.encode("iso-8859-1") + rest)
-        relay(client, upstream)
-    except Exception as e:
-        print(f"[HTTP 代理失败] 代理请求目标连接失败: {e}", flush=True)
+        authority = f"[{host}]" if ":" in host else host
+        if port != 80:
+            authority += f":{port}"
+        forwarded = [f"{method} {path} {version}", f"Host: {authority}", "Connection: close"]
+        forwarded.extend(f"{key}: {value}" for key, values in headers.items() if key not in skip for value in values)
+        if "content-length" in headers:
+            forwarded.append(f"Content-Length: {length}")
+        upstream = create_connection((host, port), timeout=20)
+        upstream.sendall(("\r\n".join(forwarded) + "\r\n\r\n").encode("iso-8859-1") + rest)
+        if length and headers.get("expect") == ["100-continue"]:
+            client.sendall(b"HTTP/1.1 100 Continue\r\n\r\n")
+        remaining = length - len(rest)
+        while remaining:
+            chunk = client.recv(min(65536, remaining))
+            if not chunk:
+                raise ConnectionError("Incomplete HTTP request body")
+            upstream.sendall(chunk)
+            remaining -= len(chunk)
+        while chunk := upstream.recv(65536):
+            client.sendall(chunk)
+    except ValueError:
+        client.sendall(_HTTP_BAD_REQUEST)
+    except OSError as exc:
+        print(f"[HTTP 代理失败] {exc}", flush=True)
         try:
             client.sendall(b"HTTP/1.1 502 Bad Gateway\r\nContent-Length: 0\r\n\r\n")
         except OSError:
@@ -396,6 +419,11 @@ def proxy_client(client: socket.socket, address: tuple[str, int]) -> None:
             pass
 
 def start_proxy_server(host: str, port: int) -> None:
+    try:
+        get_proxy_credentials()
+    except ValueError as exc:
+        print(f"[ERROR] {exc}", flush=True)
+        return
     is_ipv6 = ":" in host or host == ""
     af = socket.AF_INET6 if is_ipv6 else socket.AF_INET
     server = None
@@ -468,7 +496,12 @@ def start_proxy_server(host: str, port: int) -> None:
                 finally:
                     proxy_connection_sem.release()
 
-            threading.Thread(target=run_client, daemon=True).start()
+            try:
+                threading.Thread(target=run_client, daemon=True).start()
+            except Exception:
+                proxy_connection_sem.release()
+                client.close()
+                raise
         except Exception as e:
             print(f"[ERROR] Proxy accept failed: {e}", flush=True)
             time.sleep(0.5)

@@ -4,8 +4,8 @@
 
 **Linux VPS 向け VPNGate ノード管理・HTTP / HTTPS / SOCKS5 プロキシゲートウェイ**
 
-[![Release](https://img.shields.io/github/v/release/baoweise-bot/aimili-vpngate?style=flat-square&label=stable&color=16a34a)](https://github.com/baoweise-bot/aimili-vpngate/releases/latest)
-[![Docker](https://img.shields.io/badge/Docker-amd64%20%7C%20386%20%7C%20arm64%20%7C%20armv7-0ea5e9?style=flat-square&logo=docker&logoColor=white)](https://github.com/baoweise-bot/aimili-vpngate/pkgs/container/aimili-vpngate)
+[![Release](https://img.shields.io/github/v/release/OpenMili/aimili-vpngate?style=flat-square&label=stable&color=16a34a)](https://github.com/OpenMili/aimili-vpngate/releases/latest)
+[![Docker](https://img.shields.io/badge/Docker-amd64%20%7C%20386%20%7C%20arm64%20%7C%20armv7-0ea5e9?style=flat-square&logo=docker&logoColor=white)](https://github.com/OpenMili/aimili-vpngate/pkgs/container/aimili-vpngate)
 [![License](https://img.shields.io/badge/License-GPL--3.0-334155?style=flat-square)](../LICENSE)
 
 [简体中文](../README.md) · [English](README.en.md) · **日本語** · [한국어](README.ko.md)
@@ -33,13 +33,7 @@ AimiliVPN は Python 標準ライブラリで VPNGate ノードを管理し、�
 <a id="quick-install"></a>
 ## クイックインストール
 
-対応する Linux VPS で `root` として実行します。
-
-```bash
-bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
-```
-
-完了後、Web 管理画面の URL、専用パス、ユーザー名、パスワードが表示されます。`ml` で管理メニューを開けます。
+Linux VPS では [リリースのインストール手順](#source-release) に従い、root でインストールしてください。Web のローカルアドレスと初回認証情報が表示されます。
 
 > [!TIP]
 > VPS の管理画面で TUN/TAP を有効にし、`/dev/net/tun` が存在することを確認してください。Web のデフォルトポートは TCP `8787` です。可能な限り自分の IP だけを許可してください。
@@ -66,13 +60,19 @@ bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/ma
 - `root`、OpenVPN、iptables、ポリシールーティング、TUN/TAP。
 - Windows と macOS はプロキシクライアントとして利用できますが、ゲートウェイ本体は実行できません。
 
+<a id="source-release"></a>
 ### 方法 1：ソースインストーラー
 
+[GitHub Releases](https://github.com/OpenMili/aimili-vpngate/releases) の同じリリースから、新しいインストーラーを含むソースアーカイブと `sha256sums.txt` を取得してください。両ファイルだけを置いたディレクトリで root として確認し、インストールします。
+
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
+sha256sum -c sha256sums.txt && \
+  tar -xzf aimilivpn-vX.Y.Z-linux-source.tar.gz && \
+  cd aimilivpn-vX.Y.Z-linux-source && \
+  bash install.sh
 ```
 
-`/opt/aimilivpn` に配置し、システムサービスを登録します。
+`/opt/aimilivpn` に展開し、システムサービスを登録します。Python 3.9 以降が必要です。`AIMILIVPN_NONINTERACTIVE=1 bash install.sh` で初回認証情報を自動生成できます。既存の管理設定はアップグレード時に保持されます。
 
 ```bash
 ml                 # 管理メニュー
@@ -80,33 +80,26 @@ ml status          # 状態、Web URL、ユーザー名
 ml logs            # ログ
 ml restart         # 再起動
 ml password        # Web 認証情報を再設定
-ml update          # main 安定版から更新
+ml update          # 最新リリースを検証して更新
+ml update vX.Y.Z   # 特定のリリースをインストール
 ml uninstall       # アンインストール
 ```
 
-事前にスクリプトを確認する場合：
-
-```bash
-git clone --branch main --single-branch https://github.com/baoweise-bot/aimili-vpngate.git
-cd aimili-vpngate
-sudo bash install.sh
-```
-
-Linux 共通ソースアーカイブと SHA-256 は [GitHub Releases](https://github.com/baoweise-bot/aimili-vpngate/releases/latest) から取得できます。変更内容は Release Notes に掲載されます。
+開発用には確認済みの作業ディレクトリで `sudo bash install.sh --local-dev` を実行し、更新は手動で行ってください。
 
 ### 方法 2：Docker Compose
 
 Docker ホストには `/dev/net/tun`、host ネットワーク、`NET_ADMIN`、`NET_RAW` が必要です。
 
 ```bash
-git clone --branch main --single-branch https://github.com/baoweise-bot/aimili-vpngate.git
+git clone --branch main --single-branch https://github.com/OpenMili/aimili-vpngate.git
 cd aimili-vpngate
 docker compose pull
 docker compose up -d
 docker logs -f aimilivpn
 ```
 
-イメージ：`ghcr.io/baoweise-bot/aimili-vpngate:2.1`
+イメージ：`ghcr.io/openmili/aimili-vpngate:2.1`
 
 更新：
 
@@ -126,12 +119,12 @@ docker run -d \
   --cap-add NET_ADMIN \
   --cap-add NET_RAW \
   --device /dev/net/tun:/dev/net/tun \
-  -e UI_HOST=0.0.0.0 \
+  -e UI_HOST=127.0.0.1 \
   -e UI_PORT=8787 \
   -e LOCAL_PROXY_HOST=127.0.0.1 \
   -e LOCAL_PROXY_PORT=7928 \
   -v aimilivpn-data:/data \
-  ghcr.io/baoweise-bot/aimili-vpngate:2.1
+  ghcr.io/openmili/aimili-vpngate:2.1
 ```
 
 </details>
@@ -140,7 +133,7 @@ docker run -d \
 <summary><strong>GHCR を利用できない場合のローカルビルド</strong></summary>
 
 ```bash
-git clone --branch main --single-branch https://github.com/baoweise-bot/aimili-vpngate.git
+git clone --branch main --single-branch https://github.com/OpenMili/aimili-vpngate.git
 cd aimili-vpngate
 docker compose build
 docker compose up -d
@@ -156,16 +149,16 @@ docker compose up -d
 ソース版では、インストーラーが表示した URL を開きます。
 
 ```text
-http://VPS_IP:8787/private_path/
+http://127.0.0.1:8787/private_path/
 ```
 
-URL は `ml status`、認証情報の再設定は `ml password` を使用します。Docker では次のコマンドで初期設定を確認できます。
+パスワードハッシュは `ui_auth.json` に保存されます。Docker の初回認証情報ファイルは管理者のみ読み取れ、ログイン成功後に削除されます。
 
 ```bash
-docker exec aimilivpn cat /data/ui_auth.json
+docker exec aimilivpn cat /data/ui_bootstrap.json
 ```
 
-`secret_path`、`username`、`password` を使用し、初回ログイン後に変更してください。
+`secret_path`、`username`、`password` でログインします。後でパスを確認するときは `ui_auth.json` の `secret_path` を参照してください。リモート管理には SSH 転送を使い、更新後は保存された `host` を確認してください。
 
 ### 2. ノードを取得して接続
 
@@ -213,7 +206,7 @@ ssh -N \
 | Web サイト / フォーラム | お知らせと交流 | [339936.xyz](https://339936.xyz) |
 | Telegram | リアルタイム交流 | [t.me/arestemple](https://t.me/arestemple) |
 | YouTube | インストール・利用方法 | [動画を見る](https://www.youtube.com/watch?v=s-ATfXR8BpI) |
-| GitHub Issues | 再現可能な不具合と機能要望 | [Issue を作成](https://github.com/baoweise-bot/aimili-vpngate/issues) |
+| GitHub Issues | 再現可能な不具合と機能要望 | [Issue を作成](https://github.com/OpenMili/aimili-vpngate/issues) |
 | メール | 不具合報告と連絡 | [yaohunse7@gmail.com](mailto:yaohunse7@gmail.com) |
 
 <a id="legal"></a>
@@ -231,6 +224,6 @@ ssh -N \
 
 <div align="center">
 
-[Stable Release](https://github.com/baoweise-bot/aimili-vpngate/releases/latest) · [Issues](https://github.com/baoweise-bot/aimili-vpngate/issues) · [GPL-3.0 License](../LICENSE)
+[Stable Release](https://github.com/OpenMili/aimili-vpngate/releases/latest) · [Issues](https://github.com/OpenMili/aimili-vpngate/issues) · [GPL-3.0 License](../LICENSE)
 
 </div>

@@ -1,0 +1,3 @@
+install.sh text eol=lf
+# The metadata SHA-256 covers the original snapshot bytes.
+mirror/vpngate.csv -text whitespace=cr-at-eol

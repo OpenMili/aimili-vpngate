@@ -1,6 +1,6 @@
 services:
   aimilivpn:
-    image: ghcr.io/baoweise-bot/aimili-vpngate:2.1
+    image: ghcr.io/openmili/aimili-vpngate:2.1
     build:
       context: .
       args:
@@ -17,13 +17,24 @@ services:
     environment:
       DEPLOYMENT_MODE: docker
       VPNGATE_DATA_DIR: /data
-      UI_HOST: "0.0.0.0"
+      UI_HOST: "${UI_HOST:-127.0.0.1}"
       UI_PORT: "8787"
+      UI_TRUST_LOOPBACK_PROXY:
+      VPNGATE_TUN_DNS:
+      VPNGATE_ROUTE_TABLE:
+      VPNGATE_ROUTE_PRIORITY:
+      VPNGATE_API_HTTP_URL:
+      VPNGATE_IP_BATCH_URL:
       LOCAL_PROXY_HOST: "127.0.0.1"
       LOCAL_PROXY_PORT: "7928"
+      OPENVPN_UPSTREAM_HTTP:
+      OPENVPN_UPSTREAM_SOCKS:
+      API_SOURCE_DEADLINE_SECONDS:
+      TARGET_VALID_NODES:
     volumes:
       - aimilivpn-data:/data
     init: true
+    stop_grace_period: 20s
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped

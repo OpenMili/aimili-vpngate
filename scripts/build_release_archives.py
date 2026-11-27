@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import re
 import shutil
 import tarfile
 import tempfile
@@ -19,6 +20,8 @@ RELEASE_FILES = [
     "vpn_utils.py",
     "proxy_server.py",
     "snapshot_utils.py",
+    "auth_store.py",
+    "release_utils.py",
     "Dockerfile",
     "compose.yaml",
 ]
@@ -34,9 +37,8 @@ def sha256(path: Path) -> str:
 
 def build_archive(root: Path, output_dir: Path) -> Path:
     version = (root / "VERSION").read_text(encoding="utf-8").strip()
-    version_parts = version.split(".")
-    if len(version_parts) not in (2, 3) or any(not part.isdigit() for part in version_parts):
-        raise ValueError("VERSION 必须是点分隔的数字版本号")
+    if not re.fullmatch(r"[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}", version):
+        raise ValueError("VERSION 必须采用 X.Y.Z 格式")
 
     missing = [name for name in RELEASE_FILES if not (root / name).is_file()]
     if missing:
@@ -57,7 +59,10 @@ def build_archive(root: Path, output_dir: Path) -> Path:
         package_root.mkdir()
 
         for name in RELEASE_FILES:
-            shutil.copy2(root / name, package_root / name)
+            target = package_root / name
+            shutil.copy2(root / name, target)
+            if name == "install.sh":
+                target.write_bytes(target.read_bytes().replace(b"\r\n", b"\n"))
         shutil.copytree(root / "mirror", package_root / "mirror")
 
         archive_path = output_dir / f"{package_name}.tar.gz"
@@ -65,7 +70,7 @@ def build_archive(root: Path, output_dir: Path) -> Path:
             archive.add(package_root, arcname=package_name)
 
     checksum_lines = [f"{sha256(archive_path)}  {archive_path.name}"]
-    checksum_path.write_text("\n".join(checksum_lines) + "\n", encoding="ascii")
+    checksum_path.write_bytes(("\n".join(checksum_lines) + "\n").encode("ascii"))
     return archive_path
 
 

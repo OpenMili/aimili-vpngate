@@ -1,6 +1,10 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import http.client
+import socket
+import time
 import json
 import os
 import re
@@ -14,6 +18,8 @@ from pathlib import Path
 from unittest import mock
 
 import proxy_server
+import release_utils
+from scripts import build_release_archives
 import snapshot_utils
 
 _import_data_dir = tempfile.TemporaryDirectory()
@@ -60,9 +66,9 @@ def valid_snapshot_rows(rows: list[tuple[str, str, str]]) -> str:
             f"remote {ip} 1194 udp\n"
             "resolv-retry infinite\n"
             "nobind\n"
-            "<ca>\nCA\n</ca>\n"
-            "<cert>\nCERT\n</cert>\n"
-            "<key>\nKEY\n</key>\n"
+            "<ca>\n-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n</ca>\n"
+            "<cert>\n-----BEGIN CERTIFICATE-----\nAA==\n-----END CERTIFICATE-----\n</cert>\n"
+            "<key>\n-----BEGIN PRIVATE KEY-----\nAA==\n-----END PRIVATE KEY-----\n</key>\n"
         )
         config = base64.b64encode(config_text.encode("utf-8")).decode("ascii")
         csv_rows.append(
@@ -91,6 +97,10 @@ class ManagerLogicTests(unittest.TestCase):
             mock.patch.object(manager, "BUNDLED_SNAPSHOT_FILE", root / "bundled_snapshot.csv"),
             mock.patch.object(manager.vpn_utils, "DATA_DIR", root),
             mock.patch.object(manager.vpn_utils, "IP_CACHE_FILE", root / "ip_cache.json"),
+            mock.patch.dict(os.environ, {"VPNGATE_IP_BATCH_URL": "https://batch.example.test"}),
+            mock.patch.object(manager, "API_HTTP_URL", ""),
+            mock.patch.object(manager, "MIRROR_HTTP_URL", ""),
+            mock.patch.object(manager.vpn_utils, "diagnose_api_failure", return_value=(0, "offline fixture")),
         ]
         for patcher in self.path_patches:
             patcher.start()
@@ -105,6 +115,7 @@ class ManagerLogicTests(unittest.TestCase):
         manager.background_refill_thread = None
         manager.background_refill_cancel_event.clear()
         manager.active_sessions.clear()
+        manager.login_attempts.clear()
 
     def tearDown(self) -> None:
         if manager.connection_attempt_lock.locked():
@@ -402,6 +413,8 @@ class ManagerLogicTests(unittest.TestCase):
             raise AssertionError(f"unexpected source: {url}")
 
         with (
+            mock.patch.object(manager, "API_HTTP_URL", "http://official.example.test/"),
+            mock.patch.object(manager, "MIRROR_HTTPS_URL", ""),
             mock.patch.object(manager, "fetch_api_text_with_deadline", side_effect=fake_fetch) as fetch_mock,
             mock.patch.object(manager, "load_blacklist", return_value={}),
             mock.patch.object(manager, "log_to_json"),
@@ -410,7 +423,7 @@ class ManagerLogicTests(unittest.TestCase):
 
         self.assertEqual(1, len(nodes))
         self.assertEqual(
-            [manager.API_HTTPS_URL, manager.API_HTTP_URL],
+            [manager.API_HTTPS_URL, "http://official.example.test/"],
             [call.args[0] for call in fetch_mock.call_args_list],
         )
 
@@ -681,6 +694,8 @@ class ManagerLogicTests(unittest.TestCase):
             return csv_text
 
         with (
+            mock.patch.object(manager, "API_HTTP_URL", "http://official.example.test/"),
+            mock.patch.object(manager, "MIRROR_HTTPS_URL", ""),
             mock.patch.object(manager, "fetch_api_text", side_effect=fake_fetch) as fetch_mock,
             mock.patch.object(manager, "load_blacklist", return_value={}),
             mock.patch.object(manager, "set_state"),
@@ -690,7 +705,7 @@ class ManagerLogicTests(unittest.TestCase):
 
         self.assertEqual(1, len(nodes))
         self.assertEqual(
-            [mock.call(manager.API_HTTPS_URL, True), mock.call(manager.API_HTTP_URL, True)],
+            [mock.call(manager.API_HTTPS_URL, True), mock.call("http://official.example.test/", True)],
             fetch_mock.call_args_list,
         )
 
@@ -816,12 +831,12 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(12, choice.call_count)
 
     def test_expired_sessions_are_removed(self) -> None:
-        manager.active_sessions.update({"expired": 99.0, "active": 101.0})
+        manager.active_sessions.update({"expired": (99.0, "test", "hash"), "active": (101.0, "test", "hash")})
 
         removed = manager.purge_expired_sessions(now=100.0)
 
         self.assertEqual(1, removed)
-        self.assertEqual({"active": 101.0}, manager.active_sessions)
+        self.assertEqual({"active": (101.0, "test", "hash")}, manager.active_sessions)
 
     def test_web_log_reader_only_returns_recent_valid_entries(self) -> None:
         log_file = manager.DATA_DIR / "logs" / "current.json"
@@ -838,8 +853,9 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual(519, entries[-1]["index"])
 
     def test_web_update_controls_only_expose_stable_main_channel(self) -> None:
-        self.assertEqual("2.1.5", manager.APP_VERSION)
-        self.assertEqual("V2.1.5 正式版", manager.APP_VERSION_LABEL)
+        version = (manager.ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
+        self.assertEqual(version, manager.APP_VERSION)
+        self.assertEqual(f"V{version} 正式版", manager.APP_VERSION_LABEL)
         self.assertIn("检测更新", manager.INDEX_HTML)
         self.assertIn("/api/check_update", manager.INDEX_HTML)
         self.assertIn("/tree/main", manager.INDEX_HTML)
@@ -848,14 +864,36 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertNotIn(">测试版<", manager.INDEX_HTML)
         self.assertIn('id="deployment_mode_label"', manager.INDEX_HTML)
 
-    def test_installer_updates_only_from_main(self) -> None:
+    def test_installer_updates_only_from_verified_release(self) -> None:
         install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
+        self.assertIn("release_utils.resolve_release(tag)", install_text)
+        self.assertIn("release_utils.install_release(release)", install_text)
+        self.assertNotIn("git clone", install_text)
+        self.assertNotIn("git fetch", install_text)
+        self.assertNotIn("raw.githubusercontent.com", install_text)
 
-        self.assertIn('DEPLOY_BRANCH="main"', install_text)
-        self.assertIn('branch = "main"', install_text)
-        self.assertNotIn("CURRENT_BRANCH", install_text)
-        self.assertNotIn("origin/master", install_text)
-        self.assertNotIn("bate", install_text.lower())
+    def test_release_package_verification_precedes_install(self) -> None:
+        with tempfile.TemporaryDirectory() as scratch:
+            root = Path(scratch)
+            archive = build_release_archives.build_archive(manager.ROOT_DIR, root / "dist")
+            manifest = (root / "dist" / "sha256sums.txt").read_bytes()
+            archive_bytes = archive.read_bytes()
+
+            def local_download(url, limit):
+                return manifest if url.endswith("/sha256sums.txt") else archive_bytes
+
+            with mock.patch.object(release_utils, "_download", side_effect=local_download):
+                release = release_utils.resolve_release("v" + manager.APP_VERSION)
+                (root / "staged").mkdir()
+                staged = release_utils.stage_release(release, root / "staged")
+                self.assertTrue((staged / "install.sh").is_file())
+                self.assertEqual(manager.APP_VERSION, (staged / "VERSION").read_text().strip())
+                with self.assertRaisesRegex(ValueError, "校验清单"):
+                    release_utils.resolve_release("v99.0.0")
+            with mock.patch.object(release_utils, "_download", return_value=archive_bytes + b"changed"), mock.patch.object(release_utils.subprocess, "run") as run:
+                with self.assertRaisesRegex(ValueError, "SHA-256"):
+                    release_utils.install_release(release)
+                run.assert_not_called()
 
     def test_installer_uses_secure_credentials_and_current_version(self) -> None:
         install_text = (manager.ROOT_DIR / "install.sh").read_text(encoding="utf-8")
@@ -864,14 +902,12 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn("secrets.choice", install_text)
         self.assertIn('get_app_version()', install_text)
         self.assertNotIn("管理终端 v2.0", install_text)
-        self.assertIn("5-90 秒", install_text)
-        self.assertIn('new_pwd = input("请输入新管理密码 (不能为空): ")', install_text)
-        self.assertIn('state["active_openvpn_node_id"] = ""', install_text)
-        self.assertIn("ip link show dev tun0", install_text)
-        self.assertIn("pidof openvpn", install_text)
+        self.assertIn("getpass(", install_text)
+        self.assertIn("socket.create_connection", install_text)
+        self.assertIn("service_status", install_text)
         self.assertIn('chmod 600 "$AUTH_FILE"', install_text)
         self.assertIn("AIMILIVPN_NONINTERACTIVE", install_text)
-        self.assertIn('["ip", "rule", "del", "table", "100"]', install_text)
+        self.assertNotIn('["ip", "rule", "del", "table", "100"]', install_text)
         self.assertIn('/etc/sysctl.d/99-aimilivpn.conf', install_text)
         self.assertNotIn('http://[::1]:${PROXY_PORT}', install_text)
 
@@ -884,7 +920,7 @@ class ManagerLogicTests(unittest.TestCase):
     def test_release_workflow_uses_full_patch_version(self) -> None:
         workflow_text = (manager.ROOT_DIR / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
-        self.assertIn("default: v2.1.5", workflow_text)
+        self.assertNotIn("default:", workflow_text)
         self.assertIn("AimiliVPN V$(tr -d '\\r\\n' < VERSION) 正式版", workflow_text)
         self.assertNotIn("cut -d. -f1,2 VERSION", workflow_text)
 
@@ -904,15 +940,15 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual("2.2.0", result["latest_version"])
         self.assertEqual("v2.2.0", result["latest_tag"])
         self.assertEqual(
-            "https://github.com/baoweise-bot/aimili-vpngate/releases/tag/v2.2.0",
+            "https://github.com/OpenMili/aimili-vpngate/releases/tag/v2.2.0",
             result["release_url"],
         )
         fetch_mock.assert_called_once_with(manager.GITHUB_LATEST_RELEASE_API, True)
 
     def test_latest_release_check_reports_current_formal_version(self) -> None:
         release = {
-            "tag_name": "v2.1.5",
-            "name": "AimiliVPN V2.1.5 正式版",
+            "tag_name": f"v{manager.APP_VERSION}",
+            "name": f"AimiliVPN {manager.APP_VERSION_LABEL}",
             "draft": False,
             "prerelease": False,
         }
@@ -920,7 +956,7 @@ class ManagerLogicTests(unittest.TestCase):
             result = manager.check_latest_release()
 
         self.assertFalse(result["update_available"])
-        self.assertEqual("V2.1.5 正式版", result["current_version_label"])
+        self.assertEqual(manager.APP_VERSION_LABEL, result["current_version_label"])
 
     def test_latest_release_check_reports_source_update_command(self) -> None:
         release = {"tag_name": "v2.2.0", "draft": False, "prerelease": False}
@@ -973,7 +1009,7 @@ class ManagerLogicTests(unittest.TestCase):
 
         self.assertEqual(1, len(nodes))
         self.assertEqual(
-            [manager.API_HTTPS_URL, manager.API_HTTP_URL, manager.MIRROR_HTTPS_URL],
+            [manager.API_HTTPS_URL, manager.MIRROR_HTTPS_URL],
             [call.args[0] for call in fetch_mock.call_args_list],
         )
         self.assertEqual(csv_text, manager.API_CACHE_FILE.read_text(encoding="utf-8"))
@@ -990,6 +1026,8 @@ class ManagerLogicTests(unittest.TestCase):
             raise TimeoutError("TLS unavailable")
 
         with (
+            mock.patch.object(manager, "API_HTTP_URL", "http://official.example.test/"),
+            mock.patch.object(manager, "MIRROR_HTTPS_URL", ""),
             mock.patch.object(manager, "fetch_api_text", side_effect=fake_fetch),
             mock.patch.object(manager, "load_blacklist", return_value={}),
             mock.patch.object(manager, "log_to_json"),
@@ -1044,7 +1082,151 @@ class ManagerLogicTests(unittest.TestCase):
             snapshot_utils.parse_and_validate_snapshot(csv_text)
 
 
+    def test_profile_is_canonical_and_invalid_lines_are_rejected_before_launch(self) -> None:
+        raw = snapshot_utils.decode_config(snapshot_utils.parse_and_validate_snapshot(valid_snapshot())[0]["OpenVPN_ConfigData_Base64"])
+        normalized = snapshot_utils.validate_openvpn_config(raw.replace("\n", "\r\n"))
+        self.assertEqual(normalized, snapshot_utils.validate_openvpn_config(normalized))
+        self.assertNotIn("\r", normalized)
+        profile = manager.CONFIG_DIR / "test.ovpn"
+        # Use a harmless comment to exercise each invalid line-ending spelling.
+        for separator in ("\r", "\x0b", "\u2028"):
+            with self.subTest(separator=repr(separator)), mock.patch.object(manager.subprocess, "Popen") as start:
+                profile.write_bytes(("# note" + separator + "continued\n" + raw).encode("utf-8"))
+                ok, message, _ = manager.run_openvpn_until_ready(str(profile), False, True)
+                self.assertFalse(ok)
+                self.assertIn("ERR_OVPN_CONFIG_INVALID", message)
+                start.assert_not_called()
+
+    def test_mirror_metadata_must_match_the_snapshot(self) -> None:
+        csv_text = valid_snapshot()
+        generated = time.time() - 3000
+        meta = {"sha256": hashlib.sha256(csv_text.encode()).hexdigest(), "byte_count": len(csv_text.encode()), "generated_at": generated}
+        with mock.patch.object(manager, "fetch_api_text_with_deadline", return_value=json.dumps(meta)):
+            self.assertEqual(generated, manager.read_mirror_freshness(csv_text)[0])
+            with self.assertRaisesRegex(ValueError, "不一致"):
+                manager.read_mirror_freshness(csv_text + "\n")
+
+    def test_strict_residential_metadata_survives_periodic_refresh(self) -> None:
+        candidate = self.write_nodes(1)[0]
+        enriched = dict(candidate, ip_type="residential", ip_type_confidence="high", ip_type_sources=["test"], geo_country_short="JP")
+        manager.write_json(manager.NODES_FILE, [enriched])
+        config = {"routing_ip_type": "residential", "connection_enabled": False}
+        with (
+            mock.patch.object(manager, "fetch_candidates", return_value=[dict(candidate)]),
+            mock.patch.object(manager, "load_ui_config", return_value={**config, "secret_path": "test-path"}),
+            mock.patch.object(manager, "test_multiple_nodes", return_value=[]),
+        ):
+            manager.maintain_valid_nodes(force=True)
+        stored = manager.read_nodes()[0]
+        self.assertEqual(["test"], stored["ip_type_sources"])
+        self.assertEqual("JP", stored["geo_country_short"])
+        self.assertEqual([stored], manager.apply_routing_filters([stored], config))
+        with self.assertRaises(RuntimeError):
+            manager.validate_node_allowed_by_routing(dict(stored, ip_type_confidence="low"), config)
+
+    def test_maintenance_releases_state_lock_while_switching(self) -> None:
+        candidate = dict(self.write_nodes(1)[0], probe_status="available")
+        manager.write_json(manager.NODES_FILE, [candidate])
+        can_acquire = threading.Event()
+
+        def observe_switch():
+            def observer():
+                if manager.lock.acquire(timeout=0.3):
+                    can_acquire.set()
+                    manager.lock.release()
+            checker = threading.Thread(target=observer)
+            checker.start()
+            checker.join(1)
+        with (
+            mock.patch.object(manager, "fetch_candidates", return_value=[candidate]),
+            mock.patch.object(manager, "active_openvpn_running", side_effect=[False, True, False]),
+            mock.patch.object(manager, "test_multiple_nodes", return_value=[]),
+            mock.patch.object(manager, "auto_switch_node", side_effect=observe_switch) as switch,
+        ):
+            manager.maintain_valid_nodes()
+        switch.assert_called_once()
+        self.assertTrue(can_acquire.is_set())
+
+    def test_web_login_migrates_password_and_uses_current_origin(self) -> None:
+        auth_path = manager.DATA_DIR / "ui_auth.json"
+        cfg = manager.load_ui_config()
+        legacy = {**cfg, "username": "tester", "password": "Audit-Pass-42"}
+        legacy.pop("password_hash")
+        manager.write_json(auth_path, legacy)
+        with manager.DualStackHTTPServer(("127.0.0.1", 0), manager.Handler) as server:
+            port = server.server_address[1]
+            path = f"/{cfg['secret_path']}/api/login"
+            worker = threading.Thread(target=server.serve_forever, daemon=True)
+            worker.start()
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=4)
+            try:
+                data = json.dumps({"username": "tester", "password": "Audit-Pass-42"})
+                conn.request("POST", path, data, {"Origin": f"http://127.0.0.1:{port}", "Content-Type": "application/json"})
+                response = conn.getresponse()
+                self.assertEqual(200, response.status)
+                self.assertIn("SameSite=Strict", response.getheader("Set-Cookie"))
+                self.assertEqual("DENY", response.getheader("X-Frame-Options"))
+                cookie = response.getheader("Set-Cookie").split(";", 1)[0]
+                response.read()
+                conn.request("POST", path, data, {"Origin": "http://127.0.0.1:8081", "Content-Type": "application/json"})
+                response = conn.getresponse()
+                self.assertEqual(403, response.status)
+                response.read()
+                conn.request("POST", path, data, {"Content-Type": "text/plain"})
+                response = conn.getresponse()
+                self.assertEqual(415, response.status)
+                response.read()
+                nodes_path = f"/{cfg['secret_path']}/api/nodes"
+                conn.request("GET", nodes_path, headers={"Cookie": cookie})
+                response = conn.getresponse()
+                self.assertEqual(200, response.status)
+                response.read()
+                changed = manager.load_ui_config()
+                manager.auth_store.set_password(changed, "Changed-Audit-Pass-43")
+                manager.write_json(auth_path, changed)
+                conn.request("GET", nodes_path, headers={"Cookie": cookie})
+                response = conn.getresponse()
+                self.assertEqual(401, response.status)
+                response.read()
+            finally:
+                conn.close()
+                server.shutdown()
+                worker.join(2)
+        stored = json.loads(auth_path.read_text(encoding="utf-8"))
+        self.assertNotIn("password", stored)
+        self.assertTrue(stored["password_hash"].startswith("pbkdf2-sha256$"))
+        self.assertFalse((manager.DATA_DIR / "ui_bootstrap.json").exists())
+
+
 class ProxyServerConcurrencyTests(unittest.TestCase):
+    def test_dns_failure_never_uses_the_system_resolver(self) -> None:
+        with (
+            mock.patch.object(proxy_server, "resolve_dns_over_tun0", return_value=None),
+            mock.patch.object(proxy_server.socket, "getaddrinfo") as system_resolve,
+        ):
+            with self.assertRaisesRegex(OSError, "tun0"):
+                proxy_server.create_connection(("example.test", 443))
+        system_resolve.assert_not_called()
+
+    def test_proxy_relay_preserves_half_closed_directions(self) -> None:
+        client, proxy_left = socket.socketpair()
+        proxy_right, server = socket.socketpair()
+        with client, server, proxy_left, proxy_right:
+            for sock in (client, server, proxy_left, proxy_right):
+                sock.settimeout(2)
+            thread = threading.Thread(target=proxy_server.relay, args=(proxy_left, proxy_right), daemon=True)
+            thread.start()
+            client.sendall(b"request")
+            client.shutdown(socket.SHUT_WR)
+            self.assertEqual(b"request", server.recv(32))
+            self.assertEqual(b"", server.recv(32))
+            server.sendall(b"response")
+            server.shutdown(socket.SHUT_WR)
+            self.assertEqual(b"response", client.recv(32))
+            self.assertEqual(b"", client.recv(32))
+            thread.join(2)
+            self.assertFalse(thread.is_alive())
+
     def test_socks5_rejects_client_without_no_auth_method(self) -> None:
         class Client:
             def __init__(self):

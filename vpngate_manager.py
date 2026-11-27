@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import base64
 import csv
+import ipaddress
 import json
 import os
 import queue
@@ -13,6 +14,7 @@ import shlex
 import signal
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import urllib.parse
@@ -20,6 +22,8 @@ import urllib.request
 from collections import deque
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from logging import LogRecord
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 import concurrent.futures
@@ -50,6 +54,29 @@ class DualStackHTTPServer(ThreadingHTTPServer):
             else:
                 raise e
 
+    worker_slots = threading.BoundedSemaphore(64)
+
+    def get_request(self):
+        conn, address = super().get_request()
+        conn.settimeout(10)
+        return conn, address
+
+    def process_request(self, request, client_address):
+        if not self.worker_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.worker_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self.worker_slots.release()
+
     def server_bind(self):
         if self.address_family == socket.AF_INET6:
             try:
@@ -58,6 +85,7 @@ class DualStackHTTPServer(ThreadingHTTPServer):
                 pass
         super().server_bind()
 
+import auth_store
 import vpn_utils
 import proxy_server
 import snapshot_utils
@@ -95,18 +123,18 @@ def ports_conflict(web_port: Any, proxy_port: Any) -> bool:
         return False
 
 API_HTTPS_URL = os.environ.get("VPNGATE_API_HTTPS_URL", "https://www.vpngate.net/api/iphone/").strip()
-API_HTTP_URL = os.environ.get("VPNGATE_API_HTTP_URL", "http://www.vpngate.net/api/iphone/").strip()
+API_HTTP_URL = os.environ.get("VPNGATE_API_HTTP_URL", "").strip()
 MIRROR_HTTPS_URL = os.environ.get(
     "VPNGATE_MIRROR_HTTPS_URL",
-    "https://baoweise-bot.github.io/aimili-vpngate/vpngate.csv",
+    "https://openmili.github.io/aimili-vpngate/vpngate.csv",
 ).strip()
 MIRROR_HTTP_URL = os.environ.get(
     "VPNGATE_MIRROR_HTTP_URL",
-    "http://baoweise-bot.github.io/aimili-vpngate/vpngate.csv",
+    "",
 ).strip()
 MIRROR_META_URL = os.environ.get(
     "VPNGATE_MIRROR_META_URL",
-    "https://baoweise-bot.github.io/aimili-vpngate/vpngate.meta.json",
+    "https://openmili.github.io/aimili-vpngate/vpngate.meta.json",
 ).strip()
 # Kept as the primary URL for diagnostics and backwards-compatible state output.
 API_URL = API_HTTPS_URL
@@ -115,7 +143,7 @@ CHECK_INTERVAL_SECONDS = env_int("CHECK_INTERVAL_SECONDS", 1260, 1)
 TARGET_VALID_NODES = env_int("TARGET_VALID_NODES", 3, 1)
 MAX_SCAN_ROWS = env_int("MAX_SCAN_ROWS", 300, 1)
 API_FETCH_TIMEOUT_SECONDS = env_int("API_FETCH_TIMEOUT_SECONDS", 10, 1, 60)
-API_SOURCE_DEADLINE_SECONDS = env_int("API_SOURCE_DEADLINE_SECONDS", 6, 2, 30)
+API_SOURCE_DEADLINE_SECONDS = env_int("API_SOURCE_DEADLINE_SECONDS", 10, 2, 30)
 OPENVPN_TEST_TIMEOUT_SECONDS = env_int("OPENVPN_TEST_TIMEOUT_SECONDS", 35, 1)
 MANUAL_TEST_NODE_LIMIT = env_int("MANUAL_TEST_NODE_LIMIT", 5, 1, 20)
 INITIAL_CONNECT_TEST_LIMIT = env_int("INITIAL_CONNECT_TEST_LIMIT", 10, 1, 50)
@@ -127,7 +155,12 @@ OPENVPN_AUTH_USER = os.environ.get("OPENVPN_AUTH_USER", "vpn")
 OPENVPN_AUTH_PASS = os.environ.get("OPENVPN_AUTH_PASS", "vpn")
 LOCAL_PROXY_HOST = os.environ.get("LOCAL_PROXY_HOST", "127.0.0.1")
 LOCAL_PROXY_PORT = env_int("LOCAL_PROXY_PORT", 7928, 1, 65535)
-UI_HOST = os.environ.get("UI_HOST", "::")
+UI_HOST = os.environ.get("UI_HOST", "127.0.0.1")
+UI_SESSION_TTL_SECONDS = env_int("UI_SESSION_TTL_SECONDS", 12 * 3600, 60, 30 * 86400)
+UI_TRUST_LOOPBACK_PROXY = os.environ.get("UI_TRUST_LOOPBACK_PROXY") == "1"
+POLICY_ROUTE_TABLE = env_int("VPNGATE_ROUTE_TABLE", 19709, 256, 2**31 - 1)
+POLICY_ROUTE_PRIORITY = env_int("VPNGATE_ROUTE_PRIORITY", 19709, 1, 32765)
+POLICY_ROUTE_PROTOCOL = "231"
 UI_PORT = env_int("UI_PORT", 8787, 1, 65535)
 INVALID_BACKOFF_SECONDS = env_int("INVALID_BACKOFF_SECONDS", 30 * 60, 1)
 DEPLOYMENT_MODE = os.environ.get("DEPLOYMENT_MODE", "source").strip().lower()
@@ -141,14 +174,14 @@ UPDATE_COMMAND = (
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DEFAULT_APP_VERSION = "2.1.5"
+DEFAULT_APP_VERSION = "2.1.6"
 try:
     _version_text = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
 except OSError:
     _version_text = DEFAULT_APP_VERSION
 APP_VERSION = _version_text if re.fullmatch(r"\d+\.\d+(?:\.\d+)?", _version_text) else DEFAULT_APP_VERSION
 APP_VERSION_LABEL = f"V{APP_VERSION} 正式版"
-GITHUB_REPOSITORY = "baoweise-bot/aimili-vpngate"
+GITHUB_REPOSITORY = "OpenMili/aimili-vpngate"
 GITHUB_REPOSITORY_URL = f"https://github.com/{GITHUB_REPOSITORY}"
 GITHUB_MAIN_BRANCH_URL = f"{GITHUB_REPOSITORY_URL}/tree/main"
 GITHUB_LATEST_RELEASE_API = f"https://api.github.com/repos/{GITHUB_REPOSITORY}/releases/latest"
@@ -163,14 +196,22 @@ API_CACHE_FILE = DATA_DIR / "api_snapshot.csv"
 API_CACHE_META_FILE = DATA_DIR / "api_snapshot.meta.json"
 BUNDLED_SNAPSHOT_FILE = ROOT_DIR / "mirror" / "vpngate.csv"
 WEB_LOG_MAX_ENTRIES = 500
+_last_cleanup_time = 0.0
 
 lock = threading.RLock()
+policy_routing_lock = threading.RLock()
+service_stopping = threading.Event()
+service_http_server: ThreadingHTTPServer | None = None
+openvpn_processes: set[subprocess.Popen[str]] = set()
+login_attempts: dict[str, deque[float]] = {}
 maintenance_lock = threading.Lock()
 connection_attempt_lock = threading.Lock()
 background_refill_lock = threading.Lock()
 background_refill_cancel_event = threading.Event()
 background_refill_thread: threading.Thread | None = None
-active_sessions: dict[str, float] = {}
+# Expiration and the credentials in effect at login. External changes by ml
+# invalidate existing sessions just as changes made through the Web UI do.
+active_sessions: dict[str, tuple[float, str, str]] = {}
 active_openvpn_process: subprocess.Popen[str] | None = None
 pending_openvpn_process: subprocess.Popen[str] | None = None
 active_connection_cancel_event: threading.Event | None = None
@@ -214,22 +255,31 @@ def purge_expired_sessions(now: float | None = None) -> int:
     current_time = time.time() if now is None else now
     with lock:
         expired_tokens = [
-            token for token, expires_at in active_sessions.items()
-            if expires_at <= current_time
+            token for token, session in active_sessions.items()
+            if session[0] <= current_time
         ]
         for token in expired_tokens:
             active_sessions.pop(token, None)
     return len(expired_tokens)
 
+def write_private_text(path: Path, text: str) -> None:
+    fd, name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    tmp = Path(name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(text)
+        tmp.replace(path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 def ensure_dirs() -> None:
     DATA_DIR.mkdir(exist_ok=True, parents=True)
     CONFIG_DIR.mkdir(exist_ok=True, parents=True)
     if not AUTH_FILE.exists():
-        AUTH_FILE.write_text(f"{OPENVPN_AUTH_USER}\n{OPENVPN_AUTH_PASS}\n", encoding="utf-8")
-        try:
-            AUTH_FILE.chmod(0o600)
-        except OSError:
-            pass
+        write_private_text(AUTH_FILE, f"{OPENVPN_AUTH_USER}\n{OPENVPN_AUTH_PASS}\n")
+    else:
+        AUTH_FILE.chmod(0o600)
 
 def upstream_proxy_auth_file() -> str | None:
     username, password = vpn_utils.get_upstream_proxy_auth()
@@ -237,11 +287,7 @@ def upstream_proxy_auth_file() -> str | None:
         return None
     try:
         DATA_DIR.mkdir(exist_ok=True, parents=True)
-        UPSTREAM_PROXY_AUTH_FILE.write_text(f"{username}\n{password or ''}\n", encoding="utf-8")
-        try:
-            UPSTREAM_PROXY_AUTH_FILE.chmod(0o600)
-        except OSError:
-            pass
+        write_private_text(UPSTREAM_PROXY_AUTH_FILE, f"{username}\n{password or ''}\n")
         return str(UPSTREAM_PROXY_AUTH_FILE)
     except Exception as exc:
         print(f"[上游代理认证] 写入认证文件失败: {exc}", flush=True)
@@ -249,19 +295,8 @@ def upstream_proxy_auth_file() -> str | None:
 
 def write_json(path: Path, data: Any) -> None:
     with lock:
-        tmp = path.with_suffix(path.suffix + ".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        if path.name == "ui_auth.json":
-            try:
-                tmp.chmod(0o600)
-            except OSError:
-                pass
-        tmp.replace(path)
-        if path.name == "ui_auth.json":
-            try:
-                path.chmod(0o600)
-            except OSError:
-                pass
+        write_private_text(path, json.dumps(data, ensure_ascii=False, indent=2))
+
 
 def read_json(path: Path, default: Any) -> Any:
     with lock:
@@ -317,8 +352,8 @@ def load_ui_config() -> dict[str, Any]:
         auth_file = DATA_DIR / "ui_auth.json"
         config = {
             "username": "",
-            "secret_path": "EJsW2EeBo9lY",
-            "password": "",
+            "secret_path": "",
+            "password_hash": "",
             "host": UI_HOST,
             "port": UI_PORT,
             "proxy_port": LOCAL_PROXY_PORT,
@@ -344,15 +379,26 @@ def load_ui_config() -> dict[str, Any]:
                 for key in ["host", "port", "proxy_port", "routing_mode", "force_country", "routing_ip_type", "connection_enabled", "fixed_node_id", "favorite_node_ids", "fav_fail_fallback", "discovery_countries"]:
                     if key not in data:
                         updated = True
-            except Exception:
-                pass
-        
+            except (OSError, ValueError, AttributeError) as exc:
+                raise ValueError(f"无法读取管理配置 {auth_file}") from exc
+
+        if not config.get("secret_path"):
+            config["secret_path"] = secrets.token_hex(12)
+            updated = True
         if not config.get("username"):
             config["username"] = generate_random_username()
             updated = True
             
-        if not config.get("password"):
-            config["password"] = generate_random_password()
+        initial_password = None
+        if config.get("password") and not config.get("password_hash"):
+            auth_store.set_password(config, str(config["password"]))
+            updated = True
+        elif not config.get("password_hash"):
+            initial_password = generate_random_password()
+            auth_store.set_password(config, initial_password)
+            updated = True
+        if "password" in config:
+            config.pop("password")
             updated = True
 
         normalized_port = bounded_int(config.get("port"), UI_PORT, 1, 65535)
@@ -378,9 +424,14 @@ def load_ui_config() -> dict[str, Any]:
         if not auth_file.exists() or updated:
             try:
                 DATA_DIR.mkdir(exist_ok=True, parents=True)
+                if initial_password:
+                    write_json(DATA_DIR / "ui_bootstrap.json", {
+                        "username": config["username"], "password": initial_password,
+                        "secret_path": config["secret_path"],
+                    })
                 write_json(auth_file, config)
-            except Exception:
-                pass
+            except OSError as exc:
+                raise ValueError(f"无法保存管理配置 {auth_file}") from exc
                 
         return config
 
@@ -407,12 +458,6 @@ try:
         UI_HOST = _init_cfg["host"]
 except Exception:
     pass
-
-def get_session_token(password: str, username: str = "admin") -> str:
-    salt = "aimilivpn_secure_salt_2026"
-    return hashlib.sha256((username + ":" + password + salt).encode("utf-8")).hexdigest()
-
-_last_cleanup_time = 0.0
 
 def cleanup_old_logs(logs_dir: Path) -> None:
     global _last_cleanup_time
@@ -521,8 +566,8 @@ def get_state() -> dict[str, Any]:
     ui_cfg = load_ui_config()
     state["username"] = ui_cfg.get("username", "admin")
     state["port"] = ui_cfg.get("port", 8787)
-    state["secret_path"] = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
-    state["password_set"] = bool(ui_cfg.get("password"))
+    state["secret_path"] = ui_cfg["secret_path"]
+    state["password_set"] = bool(ui_cfg.get("password_hash"))
     state["proxy_port"] = ui_cfg.get("proxy_port", 7928)
     state["routing_mode"] = ui_cfg.get("routing_mode", "auto")
     state["force_country"] = ui_cfg.get("force_country", "")
@@ -882,20 +927,6 @@ def check_latest_release() -> dict[str, Any]:
         "update_command": UPDATE_COMMAND,
     }
 
-def is_certificate_verification_error(exc: BaseException) -> bool:
-    import ssl
-
-    current: BaseException | None = exc
-    seen: set[int] = set()
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        if isinstance(current, ssl.SSLCertVerificationError):
-            return True
-        reason = getattr(current, "reason", None)
-        cause = getattr(current, "__cause__", None)
-        current = reason if isinstance(reason, BaseException) else cause
-    return False
-
 def parse_vpngate_rows(text: str) -> list[dict[str, str]]:
     return snapshot_utils.parse_and_validate_snapshot(text, max_rows=MAX_SCAN_ROWS)
 
@@ -978,8 +1009,8 @@ def row_to_node(row: dict[str, str], config_text: str) -> dict[str, Any]:
 def api_network_sources() -> list[tuple[str, str]]:
     configured = [
         ("official_https", API_HTTPS_URL),
-        ("official_http", API_HTTP_URL),
         ("github_pages_https", MIRROR_HTTPS_URL),
+        ("official_http", API_HTTP_URL),
         ("github_pages_http_redirect_https", MIRROR_HTTP_URL),
     ]
     sources: list[tuple[str, str]] = []
@@ -1020,24 +1051,25 @@ def cache_api_snapshot(text: str, source: str) -> None:
             },
         )
 
-def read_mirror_freshness() -> tuple[float, str]:
-    if not MIRROR_META_URL:
-        return 0.0, ""
-    try:
-        raw = fetch_api_text_with_deadline(MIRROR_META_URL, True, deadline_seconds=2)
-        meta = json.loads(raw)
-        generated_at = float(meta.get("generated_at", 0) or 0)
-        if generated_at <= 0:
-            return 0.0, ""
-        age_seconds = max(0, int(time.time() - generated_at))
-        if age_seconds < 3600:
-            age_text = f"{max(1, age_seconds // 60)} 分钟"
-        else:
-            age_text = f"{age_seconds / 3600:.1f} 小时"
-        return generated_at, f"镜像生成于 {age_text}前"
-    except Exception as exc:
-        print(f"[镜像元数据] 读取失败: {exc}", flush=True)
-        return 0.0, "镜像生成时间未知"
+def read_mirror_freshness(csv_text: str) -> tuple[float, str]:
+    if not MIRROR_META_URL.startswith("https://"):
+        raise ValueError("镜像元数据需要 HTTPS 地址")
+    raw = fetch_api_text_with_deadline(MIRROR_META_URL, True, deadline_seconds=5)
+    meta = json.loads(raw)
+    encoded = csv_text.encode("utf-8")
+    if meta.get("sha256") != hashlib.sha256(encoded).hexdigest() or meta.get("byte_count") != len(encoded):
+        raise ValueError("GitHub Pages 快照与元数据不一致")
+    generated_at = float(meta["generated_at"])
+    if not 0 < generated_at <= time.time() + 300:
+        raise ValueError("GitHub Pages 快照生成时间无效")
+    age_seconds = max(0, int(time.time() - generated_at))
+    if age_seconds < 3600:
+        age = f"{max(1, age_seconds // 60)} 分钟"
+    else:
+        age = f"{age_seconds / 3600:.1f} 小时"
+    freshness = "，超过 30 分钟更新目标" if age_seconds > 1800 else ""
+    return generated_at, f"镜像生成于 {age}前{freshness}"
+
 
 def rows_to_candidates(
     rows: list[dict[str, str]],
@@ -1050,8 +1082,9 @@ def rows_to_candidates(
         if not ip or ip in seen_ips:
             continue
         try:
-            config_text = decode_config(row.get("OpenVPN_ConfigData_Base64", ""))
-            snapshot_utils.validate_openvpn_config(config_text)
+            config_text = snapshot_utils.validate_openvpn_config(
+                decode_config(row.get("OpenVPN_ConfigData_Base64", ""))
+            )
             node = row_to_node(row, config_text)
         except Exception as row_exc:
             print(f"[fetch_candidates] 跳过损坏或不安全的节点配置记录: {row_exc}", flush=True)
@@ -1096,6 +1129,11 @@ def fetch_candidates() -> list[dict[str, Any]]:
             if not candidates:
                 raise ValueError("节点源通过格式校验，但没有未被屏蔽的候选节点")
 
+            mirror_generated_at = 0.0
+            mirror_freshness = ""
+            if source_name.startswith("github_pages"):
+                mirror_generated_at, mirror_freshness = read_mirror_freshness(api_text)
+
             # Plain HTTP remains available for older machines, but never replaces
             # the last snapshot obtained through an authenticated HTTPS channel.
             if url.startswith("https://"):
@@ -1110,10 +1148,6 @@ def fetch_candidates() -> list[dict[str, Any]]:
                 if discovery_countries
                 else f"保留全部 {len(filtered_candidates)} 个"
             )
-            mirror_generated_at = 0.0
-            mirror_freshness = ""
-            if source_name.startswith("github_pages"):
-                mirror_generated_at, mirror_freshness = read_mirror_freshness()
             source_note = f"，{mirror_freshness}" if mirror_freshness else ""
 
             set_state(
@@ -1250,19 +1284,21 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
             "--auth-nocache",
             "--remote-cert-tls",
             "server",
+            "--script-security",
+            "1",
+            "--tls-version-min",
+            "1.2",
         ]
     )
     
     version = get_openvpn_version()
     if version >= 2.5:
+        command.extend(["--allow-compression", "no"])
         command.extend(["--data-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"])
     else:
         command.extend(["--ncp-ciphers", "AES-128-CBC:AES-256-GCM:AES-128-GCM:CHACHA20-POLY1305"])
 
     command.extend(["--verb", "3"])
-    
-    if os.path.exists("/etc/ssl/certs"):
-        command.extend(["--capath", "/etc/ssl/certs"])
     
     try:
         content = Path(config_file).read_text(encoding="utf-8", errors="replace")
@@ -1285,22 +1321,26 @@ def openvpn_command(config_file: str, route_nopull: bool, dev: str = "tun0") -> 
     return command
 
 def stop_process(process: subprocess.Popen[str] | None) -> None:
-    if process is None or process.poll() is not None:
+    if process is None:
         return
     try:
-        process.terminate()
-    except OSError:
-        return
-    try:
-        process.wait(timeout=8)
-    except subprocess.TimeoutExpired:
-        try:
-            process.kill()
-        except OSError:
-            pass
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    finally:
+        with lock:
+            openvpn_processes.discard(process)
 
 def begin_connection_attempt() -> tuple[int, threading.Event]:
     global connection_epoch, active_connection_cancel_event, is_connecting
+    if service_stopping.is_set():
+        raise ConnectionCancelled("服务正在停止")
     if not connection_attempt_lock.acquire(blocking=False):
         raise RuntimeError("当前已有连接切换任务正在运行，请稍后再试")
 
@@ -1372,7 +1412,7 @@ def kill_existing_openvpn_processes() -> None:
                 continue
             cmdline = " ".join(args)
             executable = Path(args[0]).name.lower()
-            if "openvpn" not in executable and "openvpn" not in cmdline.lower():
+            if executable != Path(split_openvpn_command()[0]).name.lower():
                 continue
             if any(marker and marker in cmdline for marker in own_markers):
                 try:
@@ -1397,6 +1437,19 @@ def kill_existing_openvpn_processes() -> None:
             print(f"[Cleanup] Terminated AimiliVPN OpenVPN processes: {killed_pids}", flush=True)
     except Exception as e:
         print(f"[Cleanup Error] Failed to kill existing OpenVPN processes: {e}", flush=True)
+
+def cleanup_stale_configs(now: float | None = None) -> None:
+    cutoff = (time.time() if now is None else now) - 7 * 86400
+    current = {f"{node['id']}.ovpn" for node in read_nodes() if node.get("id")}
+    for path in CONFIG_DIR.glob("*.ovpn"):
+        if path.name in current or not re.fullmatch(r"[A-Za-z0-9_.-]+\.ovpn", path.name):
+            continue
+        try:
+            if not path.is_symlink() and path.is_file() and path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            continue
+
 
 def update_handshake_status(line_lower: str) -> None:
     status_map = {
@@ -1427,6 +1480,14 @@ def run_openvpn_until_ready(
 ) -> tuple[bool, str, subprocess.Popen[str] | None]:
     global pending_openvpn_process
     limit = timeout if timeout is not None else OPENVPN_TEST_TIMEOUT_SECONDS
+    if service_stopping.is_set():
+        return False, "服务正在停止", None
+    try:
+        path = Path(config_file)
+        sanitized = snapshot_utils.validate_openvpn_config(path.read_bytes().decode("utf-8"))
+        write_private_text(path, sanitized)
+    except (ValueError, OSError) as exc:
+        return False, f"[ERR_OVPN_CONFIG_INVALID] 不安全或无法读取的节点配置: {exc}", None
     try:
         process = subprocess.Popen(
             openvpn_command(config_file, route_nopull, dev),
@@ -1442,12 +1503,14 @@ def run_openvpn_until_ready(
     except OSError as exc:
         return False, f"[错误代码 2002] [ERR_OVPN_START_FAILED] openvpn 启动失败: {exc}。原因: 系统权限不足或配置冲突。", None
 
-    if track_pending:
-        with lock:
-            if cancel_event is not None and cancel_event.is_set():
-                stop_process(process)
-                return False, "连接操作已取消", None
+    with lock:
+        openvpn_processes.add(process)
+        cancelled_before_start = service_stopping.is_set() or (cancel_event is not None and cancel_event.is_set())
+        if track_pending and not cancelled_before_start:
             pending_openvpn_process = process
+    if cancelled_before_start:
+        stop_process(process)
+        return False, "连接操作已取消", None
 
     lines: queue.Queue[str | None] = queue.Queue()
     startup_done = [False]
@@ -1480,7 +1543,7 @@ def run_openvpn_until_ready(
     cancelled = False
     message = "OpenVPN did not complete initialization."
     while time.time() - started < limit:
-        if cancel_event is not None and cancel_event.is_set():
+        if service_stopping.is_set() or (cancel_event is not None and cancel_event.is_set()):
             cancelled = True
             message = "连接操作已取消"
             break
@@ -1541,69 +1604,56 @@ def run_openvpn_until_ready(
     return ok, message, process
 
 
-def setup_policy_routing(interface: str = "tun0") -> bool:
-    try:
-        subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
-    except Exception:
-        pass
-    try:
-        subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
-    except Exception:
-        pass
-    
-    success = False
-    for attempt in range(1, 4):
-        try:
-            subprocess.run(["ip", "route", "add", "default", "dev", interface, "table", "100"], check=True, timeout=2)
-            subprocess.run(["ip", "rule", "add", "oif", interface, "table", "100"], check=True, timeout=2)
-            # 配置反向路径过滤 rp_filter 为 loose 模式 (2)，防止回包被内核静默丢弃
-            for proc_path in ["all", "default", interface]:
-                try:
-                    subprocess.run(["sysctl", "-w", f"net.ipv4.conf.{proc_path}.rp_filter=2"], capture_output=True, timeout=2)
-                except Exception:
-                    pass
-            print(f"[policy_routing] Enabled policy routing for interface {interface} (attempt {attempt} success)", flush=True)
-            success = True
-            break
-        except Exception as e:
-            print(f"[policy_routing] Attempt {attempt} failed to enable policy routing: {e}", flush=True)
-            time.sleep(1)
-            
-    if not success:
-        print("[路由配置失败] [错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 100 添加默认路由，这可能会导致通过 VPN 接口的出站路由无法正常解析。请检查系统是否支持策略路由、iproute2 工具是否完整，以及是否具有 root 权限。", flush=True)
-        log_to_json("ERROR", "Routing", "[错误代码 3003] [ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败。原因: 无法向路由表 100 添加默认路由")
-    return success
+def _routing_specs(interface: str) -> tuple[list[str], list[str]]:
+    table = str(POLICY_ROUTE_TABLE)
+    route = ["default", "dev", interface, "table", table, "proto", POLICY_ROUTE_PROTOCOL]
+    rule = ["pref", str(POLICY_ROUTE_PRIORITY), "oif", interface, "table", table, "protocol", POLICY_ROUTE_PROTOCOL]
+    return route, rule
 
-def cleanup_policy_routing() -> None:
-    try:
-        subprocess.run(["ip", "rule", "del", "table", "100"], capture_output=True, timeout=2)
-        subprocess.run(["ip", "route", "flush", "table", "100"], capture_output=True, timeout=2)
-        print("[policy_routing] Cleared policy routing table 100", flush=True)
-    except Exception:
-        pass
+
+def setup_policy_routing(interface: str = "tun0") -> bool:
+    with policy_routing_lock:
+        cleanup_policy_routing(interface)
+        route, rule = _routing_specs(interface)
+        route_added = False
+        try:
+            subprocess.run(["ip", "-4", "route", "add", *route], check=True, capture_output=True, timeout=2)
+            route_added = True
+            subprocess.run(["ip", "-4", "rule", "add", *rule], check=True, capture_output=True, timeout=2)
+        except (OSError, subprocess.SubprocessError) as exc:
+            if route_added:
+                cleanup_policy_routing(interface)
+            log_to_json("ERROR", "Routing", f"[ERR_ROUTE_TABLE_ADD_FAILED] 策略路由配置失败: {exc}")
+            return False
+        # Scope loose reverse-path filtering to the transient VPN interface.
+        try:
+            subprocess.run(["sysctl", "-w", f"net.ipv4.conf.{interface}.rp_filter=2"], capture_output=True, timeout=2)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        print(f"[policy_routing] Enabled dedicated routing for {interface}", flush=True)
+        return True
+
+
+def cleanup_policy_routing(interface: str = "tun0") -> None:
+    with policy_routing_lock:
+        route, rule = _routing_specs(interface)
+        for args in (["rule", "del", *rule], ["route", "del", *route]):
+            try:
+                subprocess.run(["ip", "-4", *args], capture_output=True, timeout=2)
+            except (OSError, subprocess.SubprocessError):
+                pass
+
 
 def stop_active_openvpn() -> None:
     global active_openvpn_process, active_openvpn_node_id
-    with lock:
+    with policy_routing_lock:
+        with lock:
+            process = active_openvpn_process
+            active_openvpn_process = None
+            active_openvpn_node_id = ""
         cleanup_policy_routing()
-        config_to_delete = None
-        if active_openvpn_node_id:
-            nodes = read_nodes()
-            node = next((item for item in nodes if item.get("id") == active_openvpn_node_id), None)
-            if node:
-                config_to_delete = node.get("config_file")
-                
-        stop_process(active_openvpn_process)
-        active_openvpn_process = None
-        active_openvpn_node_id = ""
-        
-        if config_to_delete:
-            try:
-                path = Path(config_to_delete)
-                if path.exists():
-                    path.unlink()
-            except Exception:
-                pass
+        stop_process(process)
+
 
 def active_openvpn_running() -> bool:
     return active_openvpn_process is not None and active_openvpn_process.poll() is None
@@ -1701,23 +1751,19 @@ def apply_routing_filters(
         candidates = [n for n in candidates if n.get("id") in fav_ids]
 
     routing_ip_type = ui_cfg.get("routing_ip_type", "all")
-    if routing_ip_type == "residential":
-        candidates = [
-            n for n in candidates
-            if (
-                n.get("ip_type") in ("residential", "mobile")
-                and n.get("ip_type_confidence") in ("medium", "high")
-            )
-            or (include_unknown_ip_type and not n.get("ip_type"))
-        ]
-    elif routing_ip_type == "hosting":
-        candidates = [
-            n for n in candidates
-            if n.get("ip_type") == "hosting"
-            or (include_unknown_ip_type and not n.get("ip_type"))
-        ]
+    return [n for n in candidates if matches_routing_ip_type(n, routing_ip_type, include_unknown_ip_type)]
 
-    return candidates
+
+def matches_routing_ip_type(node: dict[str, Any], mode: str, include_unknown: bool = False) -> bool:
+    ip_type = node.get("ip_type")
+    if include_unknown and ip_type in (None, "", "unknown"):
+        return True
+    if mode == "residential":
+        return ip_type in {"residential", "mobile"} and node.get("ip_type_confidence") in {"medium", "high"}
+    if mode == "hosting":
+        return ip_type == "hosting"
+    return True
+
 
 def normalized_country_name(country: Any) -> str:
     value = str(country or "").strip()
@@ -1784,10 +1830,9 @@ def validate_node_allowed_by_routing(node: dict[str, Any], ui_cfg: dict[str, Any
             raise RuntimeError("当前处于仅用收藏模式，不能连接未收藏节点")
 
     routing_ip_type = ui_cfg.get("routing_ip_type", "all")
-    node_ip_type = node.get("ip_type")
-    if routing_ip_type == "residential" and node_ip_type not in ("residential", "mobile"):
-        raise RuntimeError("当前已锁定住宅 IP 出站，不能连接非住宅节点")
-    if routing_ip_type == "hosting" and node_ip_type != "hosting":
+    if not matches_routing_ip_type(node, routing_ip_type):
+        if routing_ip_type == "residential":
+            raise RuntimeError("当前已锁定住宅 IP 出站，需要中高置信度的住宅或移动节点")
         raise RuntimeError("当前已锁定机房 IP 出站，不能连接非机房节点")
 
 def enforce_active_node_allowed_by_routing(ui_cfg: dict[str, Any], reason: str = "路由规则已更新") -> str | None:
@@ -1808,28 +1853,13 @@ def enforce_active_node_allowed_by_routing(ui_cfg: dict[str, Any], reason: str =
         msg = f"{reason}，当前活动节点 {active_id} 不符合新规则，已断开连接: {exc}"
         print(f"[路由规则] {msg}", flush=True)
         log_to_json("WARNING", "Routing", msg)
-        stop_active_openvpn()
-        with lock:
-            nodes = read_nodes()
-            for item in nodes:
-                item["active"] = False
-            write_json(NODES_FILE, nodes)
-        set_state(
-            active_openvpn_node_id="",
-            active_node_latency="无活动连接",
-            proxy_ok=False,
-            proxy_ip="-",
-            proxy_latency_ms=0,
-            proxy_error=msg,
-            last_check_message=msg,
-        )
+        clear_active_connection_state(msg)
 
         if ui_cfg.get("connection_enabled", True) and ui_cfg.get("routing_mode") != "fixed_ip":
             threading.Thread(target=auto_switch_node, daemon=True).start()
         return msg
 
 def reconnect_fixed_node_if_needed(ui_cfg: dict[str, Any]) -> bool:
-    global is_connecting
     if ui_cfg.get("routing_mode") != "fixed_ip" or active_openvpn_running():
         return False
     target_id = current_fixed_node_id(ui_cfg)
@@ -1840,16 +1870,12 @@ def reconnect_fixed_node_if_needed(ui_cfg: dict[str, Any]) -> bool:
         return False
 
     print(f"[维护线程] 固定 IP 模式下 OpenVPN 未运行，正在重新拉起同一节点: {target_id}", flush=True)
-    previous_connecting = is_connecting
-    is_connecting = False
     try:
         connect_node(target_id)
         return active_openvpn_running()
     except Exception as e:
         print(f"[维护线程] 重新拉起固定节点 {target_id} 失败: {e}", flush=True)
         return False
-    finally:
-        is_connecting = previous_connecting
 
 active_test_indexes = set()
 test_indexes_lock = threading.Lock()
@@ -1884,7 +1910,7 @@ def test_node_by_id(node_id: str) -> dict[str, Any]:
     temp_path = test_config_path(node_id)
     try:
         CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-        temp_path.write_text(config_text, encoding="utf-8")
+        write_private_text(temp_path, config_text)
     except Exception as e:
         raise RuntimeError(f"Failed to write temp config file: {e}")
 
@@ -1969,7 +1995,7 @@ def test_multiple_nodes(node_ids: list[str], target_available: int | None = None
         temp_path = test_config_path(node_id)
         try:
             CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-            temp_path.write_text(config_text, encoding="utf-8")
+            write_private_text(temp_path, config_text)
         except Exception as e:
             return {
                 "id": node_id,
@@ -2169,13 +2195,7 @@ def auto_switch_node(attempt: int = 0) -> None:
             msg = f"没有可用的【{target_country}】备选节点，已断开连接，将在后台持续尝试获取新节点..."
         print(f"[自动切换] {msg}", flush=True)
         log_to_json("WARNING", "VPN", msg)
-        stop_active_openvpn()
-        with lock:
-            nodes = read_nodes()
-            for item in nodes:
-                item["active"] = False
-            write_json(NODES_FILE, nodes)
-        set_state(active_openvpn_node_id="", last_check_message=msg)
+        clear_active_connection_state(msg)
         if schedule_background_refill():
             log_to_json("INFO", "Main", "已启动唯一后台节点补齐任务")
 
@@ -2239,7 +2259,7 @@ def connect_node(node_id: str) -> str:
         config_path = Path(node["config_file"])
         try:
             CONFIG_DIR.mkdir(exist_ok=True, parents=True)
-            config_path.write_text(node.get("config_text") or "", encoding="utf-8")
+            write_private_text(config_path, node.get("config_text") or "")
         except Exception as e:
             raise RuntimeError(f"Failed to write configuration: {e}")
 
@@ -2303,11 +2323,13 @@ def connect_node(node_id: str) -> str:
                     config_path.unlink()
             except Exception:
                 pass
-            node["probe_status"] = "unavailable"
-            node["probe_message"] = message
-            for item in nodes:
-                item["active"] = False
-            write_json(NODES_FILE, sort_all_nodes(nodes))
+            with lock:
+                current_nodes = read_nodes()
+                for item in current_nodes:
+                    item["active"] = False
+                    if item.get("id") == node_id:
+                        item.update(probe_status="unavailable", probe_message=message)
+                write_json(NODES_FILE, sort_all_nodes(current_nodes))
             log_to_json("ERROR", "VPN", f"连接节点 {node_id} 失败: {message}")
             print(f"[连接核心失败] 无法与 VPN 节点 {node_id} 建立隧道连接！详情: {message}", flush=True)
             raise RuntimeError(message)
@@ -2321,7 +2343,10 @@ def connect_node(node_id: str) -> str:
         set_state(tunnel_ready=True, proxy_ready=False)
         
         set_state(active_node_latency="配置路由", last_check_message="正在配置策略路由规则与流量转发...")
-        routing_ready = setup_policy_routing("tun0")
+        with policy_routing_lock:
+            if not connection_attempt_is_current(token, cancel_event):
+                raise ConnectionCancelled("连接操作已取消")
+            routing_ready = setup_policy_routing("tun0")
         if not connection_attempt_is_current(token, cancel_event):
             raise ConnectionCancelled("连接操作已取消")
         
@@ -2421,6 +2446,26 @@ def maintain_valid_nodes(force: bool = False) -> str:
             set_state(last_check_message=msg)
             return msg
         is_connecting = True
+    owns_reservation = True
+
+    def release_reservation() -> None:
+        global is_connecting
+        nonlocal owns_reservation
+        with lock:
+            if owns_reservation:
+                is_connecting = False
+                owns_reservation = False
+
+    def reserve_again() -> bool:
+        global is_connecting
+        nonlocal owns_reservation
+        with lock:
+            if is_connecting or service_stopping.is_set():
+                return False
+            is_connecting = True
+            owns_reservation = True
+            return True
+
     try:
         # A forced refresh must not tear down a healthy tunnel. It only forces
         # the node-pool maintenance path below.
@@ -2430,18 +2475,21 @@ def maintain_valid_nodes(force: bool = False) -> str:
             connection_enabled = ui_cfg.get("connection_enabled", True)
             if connection_enabled:
                 if routing_mode == "fixed_ip":
+                    release_reservation()
                     reconnect_fixed_node_if_needed(ui_cfg)
+                    if not reserve_again():
+                        return "已有连接任务开始，本轮节点维护结束"
                 else:
                     has_active_id = False
                     with lock:
-                        if active_openvpn_node_id:
-                            has_active_id = True
-                            stop_active_openvpn()
+                        has_active_id = bool(active_openvpn_node_id)
                     if has_active_id:
+                        stop_active_openvpn()
                         print("[维护线程] 检测到当前 OpenVPN 进程已意外退出，准备自动切换节点", flush=True)
-                        is_connecting = False
+                        release_reservation()
                         auto_switch_node()
-                        is_connecting = True
+                        if not reserve_again():
+                            return "已有连接任务开始，本轮节点维护结束"
 
         try:
             set_state(is_connecting=True, last_check_message="正在拉取最新的免费 VPN 节点列表...")
@@ -2480,22 +2528,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                 if cand["id"] not in seen_ids:
                     previous = current_by_id.get(str(cand["id"]))
                     if previous:
-                        for key in [
-                            "probe_status",
-                            "probe_message",
-                            "latency_ms",
-                            "probed_at",
-                            "owner",
-                            "asn",
-                            "as_name",
-                            "location",
-                            "ip_type",
-                            "quality",
-                            "is_proxy",
-                            "is_hosting",
-                            "is_mobile",
-                            "ip_type_reason",
-                        ]:
+                        for key in ("probe_status", "probe_message", "latency_ms", "probed_at", *IP_ENRICHMENT_FIELDS):
                             if previous.get(key) not in (None, ""):
                                 cand[key] = previous.get(key)
                     merged.append(cand)
@@ -2504,14 +2537,6 @@ def maintain_valid_nodes(force: bool = False) -> str:
             if len(merged) > 1000:
                 merged = merged[:1000]
                 
-            for n in merged:
-                config_path = Path(n["config_file"])
-                if not config_path.exists():
-                    try:
-                        config_path.write_text(n["config_text"], encoding="utf-8")
-                    except Exception:
-                        pass
-                        
             write_json(NODES_FILE, merged)
             ip_enrichment_wakeup.set()
 
@@ -2567,7 +2592,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
                     available_candidates = apply_routing_filters(available_candidates, ui_cfg)
 
                 if available_candidates:
-                    is_connecting = False
+                    release_reservation()
                     set_state(is_connecting=False, last_check_message="快速首连已找到可用节点，正在建立连接...")
                     auto_switch_node()
                     if active_openvpn_running():
@@ -2580,7 +2605,8 @@ def maintain_valid_nodes(force: bool = False) -> str:
                             valid_nodes=valid_nodes_count,
                         )
                         return message
-                    is_connecting = True
+                    if not reserve_again():
+                        return "已有连接任务开始，本轮节点维护结束"
 
         tested_results: list[dict[str, Any]] = []
         if systemic_probe_failure:
@@ -2606,8 +2632,9 @@ def maintain_valid_nodes(force: bool = False) -> str:
 
             set_state(is_connecting=True, last_check_message="正在并发检测所有节点可用性...")
             tested_results = test_multiple_nodes(to_test_ids, target_available=TARGET_VALID_NODES)
-        is_connecting = False
-        
+        release_reservation()
+
+        should_auto_switch = False
         with lock:
             merged = read_nodes()
             
@@ -2640,8 +2667,10 @@ def maintain_valid_nodes(force: bool = False) -> str:
                         available_candidates = [n for n in merged if n.get("probe_status") == "available"]
                         available_candidates = apply_routing_filters(available_candidates, ui_cfg)
                         
-                        if available_candidates:
-                            auto_switch_node()
+                        should_auto_switch = bool(available_candidates)
+
+        if should_auto_switch:
+            auto_switch_node()
 
         valid_nodes_count = len([n for n in merged if n.get("probe_status") == "available"])
         total_tested = len(fast_results) + len(tested_results)
@@ -2656,7 +2685,7 @@ def maintain_valid_nodes(force: bool = False) -> str:
     except Exception as e:
         raise e
     finally:
-        is_connecting = False
+        release_reservation()
         maintenance_lock.release()
 
 
@@ -4167,20 +4196,20 @@ INDEX_HTML = r"""<!doctype html>
     <div class="dropdown">
       <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
         <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V2.1.5 正式版</span>
+        <span id="github_version_label">V2.1.6 正式版</span>
         <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
       </button>
       <div id="github_dropdown" class="dropdown-content github-dropdown">
         <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V2.1.5 正式版</div>
+          <div id="current_version_label" class="version-current-label">V2.1.6 正式版</div>
           <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
         </div>
         <button id="check_update_btn" type="button" onclick="checkForUpdate(event)">
           <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
           检测更新
         </button>
-        <a href="https://github.com/baoweise-bot/aimili-vpngate/tree/main" target="_blank" rel="noopener noreferrer">GitHub main 主分支</a>
-        <a id="latest_release_link" href="https://github.com/baoweise-bot/aimili-vpngate/releases/latest" target="_blank" rel="noopener noreferrer">下载最新正式版</a>
+        <a href="https://github.com/OpenMili/aimili-vpngate/tree/main" target="_blank" rel="noopener noreferrer">GitHub main 主分支</a>
+        <a id="latest_release_link" href="https://github.com/OpenMili/aimili-vpngate/releases/latest" target="_blank" rel="noopener noreferrer">下载最新正式版</a>
         <div id="update_check_status" class="update-check-status" role="status" aria-live="polite">点击“检测更新”查询 GitHub 最新正式版。</div>
       </div>
     </div>
@@ -4999,7 +5028,7 @@ function stableSortNodes() {
 }
 
 function render(){
-  const versionLabel = state.app_version_label || "V2.1.5 正式版";
+  const versionLabel = state.app_version_label || "V2.1.6 正式版";
   if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
   if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
   if ($("deployment_mode_label")) {
@@ -6343,16 +6372,21 @@ def check_proxy_health() -> dict[str, Any]:
             proxy_url = f"socks5h://{p_host}:{LOCAL_PROXY_PORT}"
             proxy_user, proxy_pass = proxy_server.get_proxy_credentials()
             cmd = [
-                "curl", "-s",
+                "curl", "-q", "-sS", "--noproxy", "", "--proto", "=https",
                 "-w", "\n%{time_total} %{http_code}",
                 "-x", proxy_url,
                 url,
                 "--max-time", "5"
             ]
+            curl_config = None
             if proxy_user is not None and proxy_pass is not None:
-                cmd.extend(["--proxy-user", f"{proxy_user}:{proxy_pass}"])
+                cmd.extend(["--config", "-"])
+                credential = f"{proxy_user}:{proxy_pass}".replace("\\", "\\\\").replace('"', '\\"')
+                if any(ord(char) < 32 or ord(char) == 127 for char in credential):
+                    return None
+                curl_config = f'proxy-user = "{credential}"\n'
             try:
-                res = subprocess.run(cmd, capture_output=True, text=True, timeout=6)
+                res = subprocess.run(cmd, input=curl_config, capture_output=True, text=True, timeout=6)
                 if res.returncode == 0:
                     lines = res.stdout.strip().splitlines()
                     if len(lines) >= 2:
@@ -6360,18 +6394,21 @@ def check_proxy_health() -> dict[str, Any]:
                         time_info = lines[1].strip().split()
                         if len(time_info) == 2:
                             total_time_str, http_code = time_info
-                            if http_code == "200" and ip:
+                            if http_code == "200":
+                                ip = str(ipaddress.ip_address(ip))
                                 latency_ms = int(float(total_time_str) * 1000)
                                 return {"ok": True, "ip": ip, "latency_ms": latency_ms}
-            except Exception:
+            except FileNotFoundError:
+                raise RuntimeError("缺少出口检查依赖 curl")
+            except (ValueError, OSError, subprocess.SubprocessError):
                 pass
         return None
 
     try:
-        result = _curl_check_ip("http://ip.sb")
+        result = _curl_check_ip("https://api.ipify.org")
         if result:
             return result
-        result = _curl_check_ip("http://api.ipify.org")
+        result = _curl_check_ip("https://api.ip.sb/ip")
         if result:
             return result
             
@@ -6529,14 +6566,66 @@ def active_node_pinger() -> None:
         time.sleep(10)
 
 
+def reserve_login_attempt(address: str) -> bool:
+    now = time.monotonic()
+    with lock:
+        for key in list(login_attempts):
+            if now - login_attempts[key][-1] >= 60:
+                del login_attempts[key]
+        if address not in login_attempts and len(login_attempts) >= 1024:
+            return False
+        attempts = login_attempts.setdefault(address, deque())
+        while attempts and now - attempts[0] >= 60:
+            attempts.popleft()
+        if len(attempts) >= 10:
+            return False
+        attempts.append(now)
+        return True
+
+
 class Handler(BaseHTTPRequestHandler):
+    def uses_https(self) -> bool:
+        if not UI_TRUST_LOOPBACK_PROXY:
+            return False
+        address = ipaddress.ip_address(self.client_address[0])
+        if isinstance(address, ipaddress.IPv6Address) and address.ipv4_mapped:
+            address = address.ipv4_mapped
+        return address.is_loopback and self.headers.get("X-Forwarded-Proto", "").lower() == "https"
+
+    def request_origin_allowed(self) -> bool:
+        if self.headers.get("Sec-Fetch-Site") in {"cross-site", "same-site"}:
+            return False
+        origin = self.headers.get("Origin")
+        if origin is None:
+            return True  # Non-browser clients may omit Origin.
+        scheme = "https" if self.uses_https() else "http"
+        try:
+            source = urllib.parse.urlsplit(origin)
+            host = urllib.parse.urlsplit(f"{scheme}://{self.headers.get('Host', '')}")
+            default_port = 443 if scheme == "https" else 80
+            return (
+                source.scheme == scheme and source.hostname and source.hostname == host.hostname
+                and source.username is None and not (source.path or source.query or source.fragment)
+                and (source.port or default_port) == (host.port or default_port)
+            )
+        except ValueError:
+            return False
+
+    def send_response(self, code, message=None):
+        super().send_response(code, message)
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Referrer-Policy", "no-referrer")
+        if self.uses_https():
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
+
     def get_secret_path(self) -> str:
         ui_cfg = load_ui_config()
-        return ui_cfg.get("secret_path", "EJsW2EeBo9lY")
+        return ui_cfg["secret_path"]
 
-    def is_authorized(self) -> bool:
+    def is_authorized(self, recent: bool = False) -> bool:
         ui_cfg = load_ui_config()
-        pwd = ui_cfg.get("password")
+        pwd = ui_cfg.get("password_hash")
         if not pwd:
             print("[Auth] 管理后台密码为空，已拒绝访问。请检查 ui_auth.json。", flush=True)
             return False
@@ -6556,10 +6645,16 @@ class Handler(BaseHTTPRequestHandler):
             
         purge_expired_sessions()
         with lock:
-            exp_time = active_sessions.get(session_token)
-            if exp_time is not None and exp_time > time.time():
-                return True
-        return False
+            session = active_sessions.get(session_token)
+            if session is None:
+                return False
+            exp_time, username, password_hash = session
+            config = load_ui_config()
+            if (username, password_hash) != (config.get("username"), config.get("password_hash")):
+                active_sessions.pop(session_token, None)
+                return False
+            now = time.time()
+            return exp_time > now and (not recent or now - (exp_time - UI_SESSION_TTL_SECONDS) < 600)
 
     def validate_path(self) -> str:
         secret_path = self.get_secret_path()
@@ -6601,6 +6696,8 @@ class Handler(BaseHTTPRequestHandler):
         return self.rfile.read(length) if length > 0 else b""
 
     def read_json_body(self, max_bytes: int = 65536) -> dict[str, Any]:
+        if self.headers.get("Content-Length", "0") != "0" and self.headers.get_content_type() != "application/json":
+            raise ValueError("请求体需要 application/json")
         body = self.read_request_body(max_bytes)
         if not body:
             return {}
@@ -6790,26 +6887,44 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         global is_connecting
+        if not self.request_origin_allowed():
+            self.send_json({"error": "请求来源不匹配"}, HTTPStatus.FORBIDDEN)
+            return
+        lengths = self.headers.get_all("Content-Length", [])
+        if self.headers.get("Transfer-Encoding") or len(lengths) > 1 or any(not re.fullmatch(r"[0-9]{1,9}", v) for v in lengths):
+            self.send_json({"error": "请求体格式无效"}, HTTPStatus.BAD_REQUEST)
+            return
+        if lengths and int(lengths[0]) and self.headers.get_content_type() != "application/json":
+            self.send_json({"error": "请求体需要 application/json"}, HTTPStatus.UNSUPPORTED_MEDIA_TYPE)
+            return
         effective_path = self.validate_path()
         if effective_path == "": return
         
         if effective_path == "/api/login":
+            address = self.client_address[0]
+            if not reserve_login_attempt(address):
+                self.send_json({"error": "登录尝试过多，请稍后再试"}, HTTPStatus.TOO_MANY_REQUESTS)
+                return
             try:
                 payload = self.read_json_body()
                 input_pwd = str(payload.get("password") or "")
                 input_uname = str(payload.get("username") or "")
                 
                 ui_cfg = load_ui_config()
-                expected_pwd = ui_cfg.get("password", "")
                 expected_uname = ui_cfg.get("username", "admin")
                 
-                password_matches = bool(expected_pwd) and secrets.compare_digest(input_pwd, str(expected_pwd))
-                username_matches = secrets.compare_digest(input_uname, str(expected_uname))
+                password_matches = auth_store.verify_password(ui_cfg, input_pwd)
+                username_matches = secrets.compare_digest(input_uname.encode(), str(expected_uname).encode())
                 if password_matches and username_matches:
                     token = uuid.uuid4().hex
                     purge_expired_sessions()
                     with lock:
-                        active_sessions[token] = time.time() + 30 * 24 * 3600
+                        login_attempts.pop(address, None)
+                        active_sessions[token] = (time.time() + UI_SESSION_TTL_SECONDS, expected_uname, ui_cfg["password_hash"])
+                    try:
+                        (DATA_DIR / "ui_bootstrap.json").unlink(missing_ok=True)
+                    except OSError:
+                        log_to_json("WARNING", "Web", "无法删除首次登录凭据文件 ui_bootstrap.json")
                     body = json.dumps({"ok": True}).encode("utf-8")
                     self.send_response(HTTPStatus.OK)
                     self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -6817,7 +6932,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header("Cache-Control", "no-store")
                     secret_path = self.get_secret_path()
                     cookie_path = f"/{secret_path}/" if secret_path else "/"
-                    self.send_header("Set-Cookie", f"session={token}; Path={cookie_path}; HttpOnly; SameSite=Lax; Max-Age=2592000")
+                    secure = "; Secure" if self.uses_https() else ""
+                    self.send_header("Set-Cookie", f"session={token}; Path={cookie_path}; HttpOnly; SameSite=Strict; Max-Age={UI_SESSION_TTL_SECONDS}{secure}")
                     self.end_headers()
                     self.wfile.write(body)
                 else:
@@ -6847,7 +6963,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/json; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
-                self.send_header("Set-Cookie", f"session=; Path={cookie_path}; HttpOnly; SameSite=Lax; Max-Age=0; Expires=Thu, 01 Jan 1970 00:00:00 GMT")
+                secure = "; Secure" if self.uses_https() else ""
+                self.send_header("Set-Cookie", f"session=; Path={cookie_path}; HttpOnly; SameSite=Strict; Max-Age=0{secure}")
                 self.end_headers()
                 self.wfile.write(body)
             except Exception as exc:
@@ -6859,6 +6976,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if effective_path == "/api/update_credentials":
+            if not self.is_authorized(recent=True):
+                self.send_json({"error": "请重新登录后在 10 分钟内修改安全设置"}, HTTPStatus.FORBIDDEN)
+                return
             try:
                 payload = self.read_json_body()
                 new_username = str(payload.get("username") or "").strip()
@@ -6867,7 +6987,7 @@ class Handler(BaseHTTPRequestHandler):
                 new_suffix = str(payload.get("secret_path") or "").strip()
                 
                 ui_cfg = load_ui_config()
-                if not new_username or (not new_password and not ui_cfg.get("password")):
+                if not new_username or (not new_password and not ui_cfg.get("password_hash")):
                     self.send_json({"ok": False, "error": "用户名不能为空；首次设置时密码不能为空"}, HTTPStatus.BAD_REQUEST)
                     return
                 
@@ -6884,9 +7004,9 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
                 expected_username = ui_cfg.get("username", "")
-                expected_password = ui_cfg.get("password", "")
+                password_changed = bool(new_password and not auth_store.verify_password(ui_cfg, new_password))
                 expected_port = ui_cfg.get("port", 8787)
-                expected_suffix = ui_cfg.get("secret_path", "EJsW2EeBo9lY")
+                expected_suffix = ui_cfg["secret_path"]
 
                 if ports_conflict(new_port_int, ui_cfg.get("proxy_port", 7928)):
                     self.send_json({"ok": False, "error": "网页管理端口不能与代理出站端口相同"}, HTTPStatus.BAD_REQUEST)
@@ -6894,12 +7014,12 @@ class Handler(BaseHTTPRequestHandler):
 
                 ui_cfg["username"] = new_username
                 if new_password:
-                    ui_cfg["password"] = new_password
+                    auth_store.set_password(ui_cfg, new_password)
                 ui_cfg["port"] = new_port_int
                 ui_cfg["secret_path"] = new_suffix
                 
                 auth_file = DATA_DIR / "ui_auth.json"
-                reauth_required = new_username != expected_username or (new_password and new_password != expected_password)
+                reauth_required = new_username != expected_username or password_changed
                 with lock:
                     DATA_DIR.mkdir(exist_ok=True, parents=True)
                     write_json(auth_file, ui_cfg)
@@ -6910,12 +7030,7 @@ class Handler(BaseHTTPRequestHandler):
                 if restart_needed:
                     self.send_json({"ok": True, "restart_needed": True, "reauth_required": reauth_required, "message": "配置更新成功，网页管理端口或路径已变更，将在 2 秒内重启..."})
                     
-                    def restart_server():
-                        time.sleep(2)
-                        print("[系统] 管理后台安全配置更新，进程即将退出以触发自动重启...", flush=True)
-                        os._exit(0)
-                    
-                    threading.Thread(target=restart_server, daemon=True).start()
+                    schedule_service_restart()
                 else:
                     self.send_json({"ok": True, "restart_needed": False, "reauth_required": reauth_required, "message": "账号密码配置更新成功，已即时生效！"})
             except Exception as exc:
@@ -6980,12 +7095,7 @@ class Handler(BaseHTTPRequestHandler):
                 if restart_needed:
                     self.send_json({"ok": True, "restart_needed": True, "message": "配置更新成功，代理出站端口变更，将在 2 秒内重启..."})
                     
-                    def restart_server():
-                        time.sleep(2)
-                        print("[系统] 代理出站端口变更，进程即将退出以触发自动重启...", flush=True)
-                        os._exit(0)
-                    
-                    threading.Thread(target=restart_server, daemon=True).start()
+                    schedule_service_restart()
                 else:
                     message = policy_message or "配置更新成功，已即时生效！"
                     self.send_json({"ok": True, "restart_needed": False, "message": message})
@@ -7236,16 +7346,23 @@ class Handler(BaseHTTPRequestHandler):
         else:
             self.send_json({"error": "not found"}, HTTPStatus.NOT_FOUND)
 
+class TeeFileHandler(RotatingFileHandler):
+    def handleError(self, record: LogRecord) -> None:
+        # Logging to the redirected stderr here would recurse on disk errors.
+        pass
+
+
 class Tee:
     def __init__(self, file_path: str):
         Path(file_path).parent.mkdir(exist_ok=True, parents=True)
-        self.file = open(file_path, "a", encoding="utf-8")
         self.stdout = sys.stdout
+        self.file = TeeFileHandler(file_path, maxBytes=8 * 1024 * 1024, backupCount=3, encoding="utf-8")
+        self.file.terminator = ""
 
-    def write(self, data: str) -> None:
+    def write(self, data: str) -> int:
         self.stdout.write(data)
-        self.file.write(data)
-        self.file.flush()
+        self.file.handle(LogRecord("aimilivpn", 20, __file__, 0, "%s", (data,), None))
+        return len(data)
 
     def flush(self) -> None:
         self.stdout.flush()
@@ -7257,9 +7374,27 @@ class Tee:
     def __getattr__(self, attr: str) -> Any:
         return getattr(self.stdout, attr)
 
+
+def request_service_stop(signum=None, frame=None) -> None:
+    service_stopping.set()
+    if service_http_server is not None:
+        threading.Thread(target=service_http_server.shutdown, daemon=True).start()
+
+
+def schedule_service_restart() -> None:
+    timer = threading.Timer(1, request_service_stop)
+    timer.daemon = True
+    timer.start()
+
+
 def main() -> None:
+    global service_http_server
+    vpn_utils.enrichment_stop_event = service_stopping
+    signal.signal(signal.SIGTERM, request_service_stop)
+    signal.signal(signal.SIGINT, request_service_stop)
     ensure_dirs()
     kill_existing_openvpn_processes()
+    cleanup_stale_configs()
     
     log_file = DATA_DIR / "vpngate.log"
     tee = Tee(str(log_file))
@@ -7344,7 +7479,21 @@ def main() -> None:
     
     print(f"UI: http://{ui_host}:{ui_port}/", flush=True)
     print(f"Proxy: http://{LOCAL_PROXY_HOST}:{LOCAL_PROXY_PORT}", flush=True)
-    DualStackHTTPServer((ui_host, ui_port), Handler).serve_forever()
+    try:
+        with DualStackHTTPServer((ui_host, ui_port), Handler) as server:
+            service_http_server = server
+            if not service_stopping.is_set():
+                server.serve_forever()
+    finally:
+        service_http_server = None
+        service_stopping.set()
+        cancel_pending_connection_attempt()
+        stop_active_openvpn()
+        with lock:
+            processes = tuple(openvpn_processes)
+        for process in processes:
+            stop_process(process)
+        tee.flush()
 
 if __name__ == "__main__":
     main()

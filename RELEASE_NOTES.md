@@ -1,70 +1,30 @@
-# AimiliVPN V2.1.5 正式版
+# AimiliVPN V2.1.6 正式版
 
-V2.1.5 包含 V2.1.4 的全部稳定性、安全性和节点识别改进，并修复正式版重新安装验收中发现的失败切换恢复遗漏。
+## 本版变更
 
-## V2.1.5 热修复
+- **节点获取。** 优先使用 VPN Gate 官方 HTTPS，失败后依次读取 GitHub Pages、本地缓存和内置快照。备用源会核对 CSV 与元数据的 SHA‑256，并提示快照是否超过 30 分钟。Compose 可配置 `OPENVPN_UPSTREAM_HTTP` 或 `OPENVPN_UPSTREAM_SOCKS`。默认目标是探测到 3 个可用节点。
+- **Docker 与连接切换。** 补齐镜像中的 `curl` 和 `ping`。出口检查使用 HTTPS。统一手动与自动的住宅节点筛选，并修复切换期间阻塞状态读写及断开后就绪状态残留的问题。
+- **OpenVPN 与代理。** 下载与启动阶段都校验 OpenVPN 配置，收紧节点的证书约束。代理 DNS 通过 VPN 隧道查询。修复 HTTP、SOCKS5 输入校验及 TCP 半关闭处理。服务退出时清理自身隧道和专用策略路由。
+- **管理后台。** 新安装默认绑定 `127.0.0.1`，生成随机管理路径。密码保存为 PBKDF2 哈希。登录增加限流，改密后旧会话失效。远程管理可通过 SSH 端口转发。
+- **安装与更新。** 源码安装使用已校验的发行包。新版 `ml update` 支持指定正式标签，并在执行安装器之前校验 SHA‑256。OpenRC 服务与日志轮转也已更新。
 
-- 修复点击“断开连接”后 OpenVPN、活动节点和 table 100 已清理，但 Web API 的 `tunnel_ready` / `proxy_ready` 仍短暂保留为 `true` 的问题。
-- 手动断开现在统一复用完整连接状态清理流程；活动节点、连接中状态、隧道、代理出口、出口 IP 与路由规则会同步归零。
-- 新增手动断开状态回归测试，并在真实 VPS 上完成断开与重新连接复验。
-- 修复手动切换失败、原节点恢复失败且连续 3 个备用节点也失效后，日志提示后台重新加载但实际没有启动补位任务的问题。
-- 备用节点耗尽后现在会启动唯一后台节点补齐线程，按退避间隔重新同步并尝试连接，避免一直等到下一轮周期采集。
-- 新增自动切换耗尽回归测试，并在真实 VPS 上验证补位线程会创建且不会重复启动。
+## 安装或从旧版升级
 
-## IP 类型识别
-
-- IP 类型缓存升级到新的分类版本，旧分类会自动失效并重新检测。
-- 明确区分住宅、移动、机房和未知网络，并显示高、中、低置信度及情报来源。
-- Sony、KDDI、SoftBank、Korea Telecom 等有明确消费接入运营商信息且未命中机房特征的网络继续识别为住宅。
-- `proxy + 数据中心关键词` 冲突节点以及完全缺少运营商信息的节点会调用 `ipapi.is` 进行第二来源复核。
-- 第二来源不可用或证据不足时标记为未知/低置信度，不再直接当作住宅。
-- 严格住宅路由只接受中、高置信度住宅或移动网络，拒绝未知和低置信度分类。
-
-## 节点获取与连接切换
-
-- 修复官方 HTTPS 超时后直接跳过官方 HTTP 的问题；现在仍会继续尝试 VPNGate 官方真实 HTTP，再进入 GitHub Pages、VPS 最近缓存和内置快照。
-- GitHub 镜像状态显示生成时间与陈旧程度，HTTP 地址明确标注为跳转 HTTPS，不再描述成独立明文镜像。
-- 连接状态拆分为隧道就绪和代理出口就绪；只有 OpenVPN、策略路由与真实代理出口全部通过后，前端才显示“已连接”。
-- 修复批量节点检测失败时用空字段覆盖已有 ISP、物理位置和 IP 类型的问题。
-- 固定国家统一保存 ISO 两字母代码，并兼容旧版中文国家名称配置。
-- 物理位置国旗使用 IP 情报源国家，节点申报国家与 IP 推测位置分开提示，避免来源冲突造成误解。
-
-## 安装、安全与运维
-
-- 卸载时清理 AimiliVPN 的 sysctl 文件、table 100 路由和全部 table 100 策略规则。
-- `ui_auth.json` 创建、迁移和保存时使用私有权限 `0600`，并采用安全写入流程。
-- Web 管理端口与代理端口增加双向冲突校验，冲突配置直接拒绝，不再静默改写端口。
-- OpenVPN 启用 `remote-cert-tls server`，验证服务器证书用途并移除相关安全警告。
-- 新增 `AIMILIVPN_NONINTERACTIVE=1` 无人值守安装模式，首次部署不会停在交互提示。
-- 安装完成信息只显示实际默认监听的 IPv4 本地代理地址，不再错误提示未启用的 IPv6 地址。
-
-## 验证与兼容性
-
-- 本地 Python 单元测试 53/53 通过，Python 编译、Dashboard JavaScript 语法、安装脚本语法和补丁格式检查通过。
-- Ubuntu 22.04 x86_64 VPS 已完成真实卸载、重新安装、节点源、连接切换、代理出口、Web API、权限和路由残留验证。
-- 发布流水线会在 Python 3.9、3.11、3.13 上运行完整测试。
-- Docker 会分别构建验证 `linux/amd64`、`linux/386`、`linux/arm64`、`linux/arm/v7`，并发布统一多架构镜像清单。
-
-## 平台限制
-
-- GitHub Actions 定时任务由 GitHub 调度，不保证每 15 分钟准点运行。
-- GitHub Pages 会把 HTTP 强制跳转到 HTTPS，不能作为真正的明文 HTTP 镜像。
-- 程序保留 VPNGate 官方 HTTP、VPS 最近有效缓存和内置初始快照，以降低上述平台限制的影响。
-
-## 下载与更新
-
-- GitHub Release：`aimilivpn-v2.1.5-linux-source.tar.gz` 和 `sha256sums.txt`。
-- GHCR：`2.1.5`、`2.1`、`latest` 多架构镜像标签。
-
-Python 源码安装更新：
+在 Linux 上以 `root` 运行。把源码包和同一发行版的 `sha256sums.txt` 下载到一个新目录，校验通过后再安装。
 
 ```bash
-ml update
+sha256sum -c sha256sums.txt &&
+  tar -xzf aimilivpn-v2.1.6-linux-source.tar.gz &&
+  cd aimilivpn-v2.1.6-linux-source &&
+  bash install.sh
 ```
 
-Docker Compose 更新：
+从 `v2.1.5` 及更早的源码版升级时，请先执行上面的流程。升级保留现有管理配置。请核对已有 `ui_auth.json` 的 `host`，将仅供本机管理的实例设为 `127.0.0.1`。
 
-```bash
-docker compose pull
-docker compose up -d
-```
+Docker 镜像为 `ghcr.io/openmili/aimili-vpngate:2.1.6`，支持 `linux/amd64`、`linux/386`、`linux/arm64` 和 `linux/arm/v7`。使用本版 Compose 配置可执行 `docker compose pull && docker compose up -d`。旧版 Compose 用户应先核对镜像地址和管理监听地址，并沿用现有数据卷。全新容器的首次登录信息可用 `docker exec aimilivpn cat /data/ui_bootstrap.json` 获取。首次成功登录后该文件会清除。
+
+## 兼容性与测试
+
+- 发布前工作树已通过 61 项单元测试。Docker 在隔离环境完成 Web 登录、HTTP、HTTPS CONNECT、SOCKS5、手动切换、自动故障转移和退出清理。另有一个公网 VPN Gate 节点通过出口检查。
+- Alpine/OpenRC 实测通过安装、校验更新、启停和卸载。Debian 验证了 systemd 单元和安装器报告启动失败的行为。Debian 实机的完整安装启动仍待验证。
+- GitHub Pages 定时任务配置为每 15 分钟触发。实际发布时间以快照元数据为准，备用列表中的节点仍需连通性检测。

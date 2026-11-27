@@ -4,8 +4,8 @@
 
 **面向 Linux VPS 的 VPNGate 节点管理与 HTTP / HTTPS / SOCKS5 代理网关**
 
-[![正式版本](https://img.shields.io/github/v/release/baoweise-bot/aimili-vpngate?style=flat-square&label=正式版&color=16a34a)](https://github.com/baoweise-bot/aimili-vpngate/releases/latest)
-[![Docker](https://img.shields.io/badge/Docker-amd64%20%7C%20386%20%7C%20arm64%20%7C%20armv7-0ea5e9?style=flat-square&logo=docker&logoColor=white)](https://github.com/baoweise-bot/aimili-vpngate/pkgs/container/aimili-vpngate)
+[![正式版本](https://img.shields.io/github/v/release/OpenMili/aimili-vpngate?style=flat-square&label=正式版&color=16a34a)](https://github.com/OpenMili/aimili-vpngate/releases/latest)
+[![Docker](https://img.shields.io/badge/Docker-amd64%20%7C%20386%20%7C%20arm64%20%7C%20armv7-0ea5e9?style=flat-square&logo=docker&logoColor=white)](https://github.com/OpenMili/aimili-vpngate/pkgs/container/aimili-vpngate)
 [![License](https://img.shields.io/badge/License-GPL--3.0-334155?style=flat-square)](LICENSE)
 
 **简体中文** · [English](docs/README.en.md) · [日本語](docs/README.ja.md) · [한국어](docs/README.ko.md)
@@ -43,7 +43,7 @@ AimiliVPN 使用 Python 标准库管理 VPNGate 节点，提供节点获取与�
 | 本机代理 | `127.0.0.1:7928`，支持 HTTP、HTTPS `CONNECT` 和 SOCKS5 |
 | 源码部署 | x64、x86、ARM64、ARM32 Linux |
 | Docker 镜像 | `linux/amd64`、`linux/386`、`linux/arm64`、`linux/arm/v7` |
-| 更新通道 | GitHub `main` 正式分支 / 最新正式 Release |
+| 更新通道 | GitHub SHA-256 校验的 GitHub 正式 Release |
 
 > [!IMPORTANT]
 > **网络可用性提示：** 不同地区、数据中心和网络服务商可能限制 DNS、VPNGate API、GitHub 镜像或 VPN 协议。镜像与本地缓存只能提高节点列表的可用性，不能保证所有机型都能建立连接。部署前请确认所在地法律和 VPS 服务商条款允许使用 VPN/TUN。
@@ -51,22 +51,10 @@ AimiliVPN 使用 Python 标准库管理 VPNGate 节点，提供节点获取与�
 <a id="quick-install"></a>
 ## 快速安装
 
-使用 `root` 用户在受支持的 Linux VPS 上执行：
-
-```bash
-bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
-```
-
-安装完成后，终端会显示 Web 后台完整地址、随机安全路径、登录账号和密码。输入 `ml` 可打开管理菜单。
-
-无人值守安装可显式跳过首次参数询问，并自动生成安全路径和登录凭据：
-
-```bash
-AIMILIVPN_NONINTERACTIVE=1 bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
-```
+在 Linux VPS 上按[发行包安装步骤](#source-release)校验并安装。以 `root` 运行安装器，终端会输出本机 Web 地址和首次登录凭据。
 
 > [!TIP]
-> 安装前请在 VPS 控制面板启用 TUN/TAP，并确认 `/dev/net/tun` 存在。Web 默认使用 TCP `8787`，安全组建议只允许自己的 IP 访问。
+> 安装前请在 VPS 控制面板启用 TUN/TAP，并确认 `/dev/net/tun` 存在。Web 默认在回环地址监听 TCP `8787`，远程访问可通过 SSH 端口转发。
 
 <a id="installation"></a>
 ## 完整安装
@@ -77,13 +65,19 @@ AIMILIVPN_NONINTERACTIVE=1 bash <(curl -Ls https://raw.githubusercontent.com/bao
 - 权限与组件：`root`、OpenVPN、iptables、策略路由和 TUN/TAP。
 - Windows 与 macOS 可作为代理客户端，但不能直接运行完整网关；Docker Desktop 也不等同于具备宿主机 TUN 能力的 Linux VPS。
 
+<a id="source-release"></a>
 ### 方式一：一键源码安装
 
+从 [GitHub Releases](https://github.com/OpenMili/aimili-vpngate/releases) 下载含新版安装器的发行包和同一发行版的 `sha256sums.txt`。在仅含这两个文件的目录中，以 `root` 核对后安装。首次部署需要先信任下载来源。
+
 ```bash
-bash <(curl -Ls https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)
+sha256sum -c sha256sums.txt && \
+  tar -xzf aimilivpn-vX.Y.Z-linux-source.tar.gz && \
+  cd aimilivpn-vX.Y.Z-linux-source && \
+  bash install.sh
 ```
 
-安装器会部署到 `/opt/aimilivpn` 并注册系统服务。常用命令：
+安装器部署到 `/opt/aimilivpn` 并注册系统服务，需要 Python 3.9 或更新版本。使用 `AIMILIVPN_NONINTERACTIVE=1 bash install.sh` 自动生成初始凭据。已有安装会保留管理配置。
 
 ```bash
 ml                 # 打开管理菜单
@@ -91,33 +85,28 @@ ml status          # 查看状态、Web 地址和账号
 ml logs            # 查看实时日志
 ml restart         # 重启服务
 ml password        # 重设 Web 账号密码
-ml update          # 从 main 正式分支更新
+ml update          # 校验并安装最新正式发行版
+ml update vX.Y.Z   # 安装指定发行版
 ml uninstall       # 卸载
 ```
 
-需要先审查脚本时：
-
-```bash
-git clone --branch main --single-branch https://github.com/baoweise-bot/aimili-vpngate.git
-cd aimili-vpngate
-sudo bash install.sh
-```
-
-通用 Linux 源码包与 SHA-256 校验文件可在 [GitHub Releases](https://github.com/baoweise-bot/aimili-vpngate/releases/latest) 下载，版本变更记录也统一放在 Release Notes 中。
+开发测试可从已经审阅的源码目录执行 `sudo bash install.sh --local-dev`。本地开发模式由管理员手动更新。
 
 ### 方式二：Docker Compose
 
 Docker 主机需要 `/dev/net/tun`、host 网络以及 `NET_ADMIN`、`NET_RAW` 权限。
 
+需要借助上游代理时，可以在 Compose 的 `.env` 中设置 `OPENVPN_UPSTREAM_HTTP` 或 `OPENVPN_UPSTREAM_SOCKS`。例如，Docker Desktop 中可设置 `OPENVPN_UPSTREAM_HTTP=http://host.docker.internal:10808`。Linux VPS 使用 host 网络且代理就在同一台机器上时，可设置 `OPENVPN_UPSTREAM_HTTP=http://127.0.0.1:10808`。该设置也会用于 TCP OpenVPN 连接。节点源默认每个地址最多等待 10 秒，代理链路较慢时可通过 `API_SOURCE_DEADLINE_SECONDS=15` 调整。
+
 ```bash
-git clone --branch main --single-branch https://github.com/baoweise-bot/aimili-vpngate.git
+git clone --branch main --single-branch https://github.com/OpenMili/aimili-vpngate.git
 cd aimili-vpngate
 docker compose pull
 docker compose up -d
 docker logs -f aimilivpn
 ```
 
-正式镜像：`ghcr.io/baoweise-bot/aimili-vpngate:2.1`
+正式镜像：`ghcr.io/openmili/aimili-vpngate:2.1`
 
 更新容器：
 
@@ -137,12 +126,12 @@ docker run -d \
   --cap-add NET_ADMIN \
   --cap-add NET_RAW \
   --device /dev/net/tun:/dev/net/tun \
-  -e UI_HOST=0.0.0.0 \
+  -e UI_HOST=127.0.0.1 \
   -e UI_PORT=8787 \
   -e LOCAL_PROXY_HOST=127.0.0.1 \
   -e LOCAL_PROXY_PORT=7928 \
   -v aimilivpn-data:/data \
-  ghcr.io/baoweise-bot/aimili-vpngate:2.1
+  ghcr.io/openmili/aimili-vpngate:2.1
 ```
 
 </details>
@@ -151,7 +140,7 @@ docker run -d \
 <summary><strong>无法拉取 GHCR 时在 VPS 本地构建</strong></summary>
 
 ```bash
-git clone --branch main --single-branch https://github.com/baoweise-bot/aimili-vpngate.git
+git clone --branch main --single-branch https://github.com/OpenMili/aimili-vpngate.git
 cd aimili-vpngate
 docker compose build
 docker compose up -d
@@ -167,18 +156,18 @@ docker compose up -d
 源码安装完成后，使用终端输出的地址访问：
 
 ```text
-http://VPS_IP:8787/随机安全路径/
+http://127.0.0.1:8787/随机安全路径/
 ```
 
 忘记地址时执行 `ml status`；需要重设账号密码时执行 `ml password`。
 
-Docker 用户可以读取首次启动时保存的 Web 配置：
+管理密码哈希保存在 `ui_auth.json`。Docker 首次登录凭据保存在仅容器管理员可读的文件中，成功登录后自动清除。
 
 ```bash
-docker exec aimilivpn cat /data/ui_auth.json
+docker exec aimilivpn cat /data/ui_bootstrap.json
 ```
 
-使用其中的 `secret_path`、`username` 和 `password` 登录，并在首次登录后修改安全路径和凭据。
+用该文件的 `secret_path`、`username` 和 `password` 登录。忘记后缀时读取 `ui_auth.json` 中的 `secret_path`。远程管理使用 SSH 转发。升级时请核对持久化配置的 `host`，旧安装可能依然监听全网卡。
 
 ### 2. 获取并连接节点
 
@@ -187,6 +176,10 @@ docker exec aimilivpn cat /data/ui_auth.json
 3. 点击目标节点的“切换”；目标预检失败时，程序会尽量保留当前可用连接。
 4. 根据需要选择智能自动、固定国家或固定 IP 模式。
 5. 在状态区域确认 VPN 已连接，并核对当前出口 IP。
+
+官方接口失败时，程序会尝试 [GitHub Pages 备用订阅](https://openmili.github.io/aimili-vpngate/vpngate.csv)，随后读取本地快照。Actions 按每 15 分钟调度，镜像实际更新时间以[快照元数据](https://openmili.github.io/aimili-vpngate/vpngate.meta.json)中的 `generated_at_iso` 为准。GitHub 可能延迟执行定时任务。客户端会提示超过 30 分钟的快照，备用订阅里的节点仍需检测。
+
+节点列表每页显示 50 条。启动和自动维护会优先探测，默认每轮找到约 3 个可用候选后停止继续派发探测。要查看剩余候选，请清除列表筛选并翻页。需要更多预探测节点时，可以调高 `TARGET_VALID_NODES`。
 
 ### 3. 在 VPS 本机使用代理
 
@@ -251,7 +244,7 @@ ssh -N \
 | 项目网站 / 交流论坛 | 公告、经验交流与讨论 | [339936.xyz](https://339936.xyz) |
 | Telegram 群 | 即时交流 | [t.me/arestemple](https://t.me/arestemple) |
 | YouTube 教程 | 安装和使用视频 | [观看视频](https://www.youtube.com/watch?v=s-ATfXR8BpI) |
-| GitHub Issues | 可复现的问题与功能建议 | [提交 Issue](https://github.com/baoweise-bot/aimili-vpngate/issues) |
+| GitHub Issues | 可复现的问题与功能建议 | [提交 Issue](https://github.com/OpenMili/aimili-vpngate/issues) |
 
 <a id="legal"></a>
 ## 使用范围与法律声明
@@ -268,6 +261,6 @@ ssh -N \
 
 <div align="center">
 
-[正式版本](https://github.com/baoweise-bot/aimili-vpngate/releases/latest) · [问题反馈](https://github.com/baoweise-bot/aimili-vpngate/issues) · [GPL-3.0 License](LICENSE)
+[正式版本](https://github.com/OpenMili/aimili-vpngate/releases/latest) · [问题反馈](https://github.com/OpenMili/aimili-vpngate/issues) · [GPL-3.0 License](LICENSE)
 
 </div>
