@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+release_tag='@RELEASE_TAG@'
+install_dir=/opt/aimilivpn-docker
+project=aimilivpn-docker
+container=aimilivpn
+
+fail() {
+    printf '%s\n' "$*" >&2
+    exit 1
+}
+
+if [[ $(uname -s) != Linux || $EUID -ne 0 ]]; then
+    fail '请在 Linux VPS 上以 root 运行 Docker 安装脚本。'
+fi
+if [[ ! -c /dev/net/tun ]]; then
+    fail '找不到 /dev/net/tun，请先在 VPS 上启用 TUN/TAP。'
+fi
+command -v docker >/dev/null || fail '请先安装 Docker Engine 和 Docker Compose 插件。'
+command -v flock >/dev/null || fail '缺少 flock，请先安装提供该命令的系统软件包。'
+compose_help=$(docker compose up --help) || fail '请先安装 Docker Compose 插件。'
+[[ $compose_help == *--wait-timeout* ]] || fail '请升级 Docker Compose 插件以支持 up --wait-timeout。'
+engine_os=$(docker info --format '{{.OSType}}') || fail '无法连接 Docker Engine。'
+[[ $engine_os == linux ]] || fail '请使用 Linux Docker Engine。'
+
+if [[ -L $install_dir || ( -e $install_dir && ( ! -d $install_dir || ! -O $install_dir ) ) ]]; then
+    fail "请检查安装目录 $install_dir 的类型和属主。"
+fi
+if [[ ! -d $install_dir ]]; then
+    mkdir -m 755 -- "$install_dir"
+fi
+cd -- "$install_dir"
+exec 9< .
+flock -n 9 || fail '另一个 AimiliVPN Docker 安装正在运行。'
+
+config="$install_dir/compose.yaml"
+if [[ -e $config || -L $config ]]; then
+    [[ -f $config && ! -L $config ]] || fail "请检查现有配置 $config。"
+    read -r marker < "$config" || fail "无法读取现有配置 $config。"
+    config_hash=$(tail -n +2 "$config" | sha256sum)
+    if [[ $marker != "# AimiliVPN managed compose ${config_hash%% *}" ]]; then
+        fail "检测到已有或手动修改的 $config，请使用原配置升级。"
+    fi
+fi
+
+existing=$(docker container ls --all --filter "name=^/$container$" --format '{{.Names}}')
+if [[ -n $existing ]]; then
+    existing_project=$(docker inspect --type container --format '{{index .Config.Labels "com.docker.compose.project"}}' "$container")
+    existing_dir=$(docker inspect --type container --format '{{index .Config.Labels "com.docker.compose.project.working_dir"}}' "$container")
+    if [[ $existing_project != "$project" || $existing_dir != "$install_dir" ]]; then
+        fail '已存在独立部署的 aimilivpn 容器，请使用原来的配置升级以保留数据。'
+    fi
+fi
+
+compose=(docker compose --project-directory "$install_dir" --project-name "$project")
+work_dir=$(mktemp -d "$install_dir/.install.XXXXXX")
+trap 'rm -rf -- "$work_dir"' EXIT
+stage="$work_dir/compose.yaml"
+cat > "$stage" <<'AIMILIVPN_COMPOSE'
+@COMPOSE_YAML@
+AIMILIVPN_COMPOSE
+
+printf '正在部署 AimiliVPN %s Docker 镜像。\n' "$release_tag"
+"${compose[@]}" --file "$stage" config --quiet
+"${compose[@]}" --file "$stage" pull
+if [[ -f $config ]]; then
+    cp -p -- "$config" "$work_dir/previous.yaml"
+fi
+mv -f -- "$stage" "$config"
+if ! "${compose[@]}" --file "$config" up -d --no-build --wait --wait-timeout 120; then
+    if [[ -f $work_dir/previous.yaml ]]; then
+        mv -f -- "$work_dir/previous.yaml" "$config"
+        if [[ -n $existing ]] && ! "${compose[@]}" --file "$config" up -d --no-build --wait --wait-timeout 120; then
+            printf '%s\n' '旧配置已还原，容器未恢复健康，请检查容器日志。' >&2
+        fi
+    fi
+    fail '容器启动或健康检查失败，请查看 docker logs aimilivpn 后重试。'
+fi
+"${compose[@]}" --file "$config" ps
+printf '配置文件位置 %s/compose.yaml\n' "$install_dir"
+printf '首次登录可运行 docker exec %s cat /data/ui_bootstrap.json\n' "$container"

@@ -13,6 +13,87 @@ if [ "$(id -u)" != "0" ]; then
     exit 1
 fi
 
+INSTALL_DIR="/opt/aimilivpn"
+local_dev=0
+case "${1:-}" in
+    --local-dev) local_dev=1 ;;
+    '') ;;
+    *) echo "用法: bash install.sh [--local-dev]" >&2; exit 1 ;;
+esac
+if [ "$#" -gt 1 ]; then
+    echo "用法: bash install.sh [--local-dev]" >&2
+    exit 1
+fi
+# Running this file from a pipe or as a standalone download installs a verified Release.
+# The packager pins this value in the downloadable install-source.sh asset.
+bootstrap_release=latest
+script_path=${BASH_SOURCE[0]:-}
+SOURCE_DIR=''
+if [[ -n $script_path && -f $script_path ]]; then
+    SOURCE_DIR=$(cd -- "$(dirname -- "$script_path")" && pwd -P)
+fi
+standalone=0
+if [[ -z $SOURCE_DIR || ( ! -e $SOURCE_DIR/vpngate_manager.py && ! -e $SOURCE_DIR/release_utils.py ) ]]; then
+    standalone=1
+fi
+if [[ $standalone == 1 || $bootstrap_release != latest ]]; then
+    if [[ $local_dev == 1 ]]; then
+        echo '--local-dev 需要完整的本地源码目录。' >&2
+        exit 1
+    fi
+    set -euo pipefail
+    for tool in curl sha256sum tar mktemp; do
+        command -v "$tool" >/dev/null || { echo "缺少命令 $tool，请先安装。" >&2; exit 1; }
+    done
+    release_url=https://github.com/OpenMili/aimili-vpngate/releases
+    channel=latest/download
+    if [[ $bootstrap_release != latest ]]; then
+        channel="download/$bootstrap_release"
+    fi
+    work_dir=$(mktemp -d)
+    trap 'rm -rf -- "$work_dir"' EXIT
+    cd -- "$work_dir"
+
+    download() {
+        curl -q --proto '=https' --proto-redir '=https' --fail --silent --show-error --location \
+            --retry 2 --connect-timeout 15 --max-time 120 --max-filesize "$3" --output "$2" "$1"
+    }
+    download "$release_url/$channel/sha256sums.txt" sha256sums.txt 4096
+    manifest=$(<sha256sums.txt)
+    pattern='^([0-9a-fA-F]{64})[[:blank:]]+\*?aimilivpn-(v[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9})-linux-source\.tar\.gz$'
+    if [[ ! $manifest =~ $pattern ]]; then
+        echo '发行版校验清单格式错误。' >&2; exit 1
+    fi
+    checksum=${BASH_REMATCH[1]}
+    release_tag=${BASH_REMATCH[2]}
+    if [[ $bootstrap_release != latest && $bootstrap_release != "$release_tag" ]]; then
+        echo '校验清单与请求的发行版不一致。' >&2; exit 1
+    fi
+    folder="aimilivpn-$release_tag-linux-source"
+    printf '正在下载并校验 AimiliVPN %s 源码发行包。\n' "$release_tag"
+    download "$release_url/download/$release_tag/$folder.tar.gz" release.tar.gz 16777216
+    printf '%s  release.tar.gz\n' "$checksum" | sha256sum -c -
+
+    # Accept only regular files and directories under the expected package root.
+    LC_ALL=C tar -tvzf release.tar.gz > types
+    if grep -qv '^[-d]' types; then
+        echo '发行包包含不支持的文件类型。' >&2; exit 1
+    fi
+    tar -tzf release.tar.gz > members
+    while IFS= read -r member; do
+        if [[ ( $member != "$folder" && $member != "$folder/"* ) || /$member/ == */../* || $member == *\\* ]]; then
+            echo '发行包包含无效路径。' >&2; exit 1
+        fi
+    done < members
+    tar -xzf release.tar.gz
+    cd -- "$folder"
+    if [[ $(< VERSION) != "${release_tag#v}" || ! -f install.sh || ! -f vpngate_manager.py ]]; then
+        echo '发行包内容与版本不符。' >&2; exit 1
+    fi
+    bash ./install.sh
+    exit 0
+fi
+
 # 2. Check OS distribution and set package manager
 OS_TYPE=""
 PKG_MGR=""
@@ -46,19 +127,6 @@ echo -e "${BLUE}==========================================================${PLAI
 echo -e "${BLUE}        欢迎使用 AimiliVPN 一键源码部署与管理脚本${PLAIN}"
 echo -e "${BLUE}==========================================================${PLAIN}"
 
-# Install from an extracted, checksum-verified Release or a trusted checkout.
-SOURCE_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-INSTALL_DIR="/opt/aimilivpn"
-local_dev=0
-case "${1:-}" in
-    --local-dev) local_dev=1 ;;
-    '') ;;
-    *) echo "用法: bash install.sh [--local-dev]" >&2; exit 1 ;;
-esac
-if [ "$#" -gt 1 ]; then
-    echo "用法: bash install.sh [--local-dev]" >&2
-    exit 1
-fi
 if [ -f "${INSTALL_DIR}/.local_dev" ]; then
     if [ "$SOURCE_DIR" != "$INSTALL_DIR" ] && [ "$local_dev" = 0 ]; then
         echo "已启用本地开发模式。请保留本地源码，或先备份后移除 ${INSTALL_DIR}/.local_dev。" >&2

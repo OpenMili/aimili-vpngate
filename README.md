@@ -51,10 +51,28 @@ AimiliVPN 使用 Python 标准库管理 VPNGate 节点，提供节点获取与�
 <a id="quick-install"></a>
 ## 快速安装
 
-在 Linux VPS 上按[发行包安装步骤](#source-release)校验并安装。以 `root` 运行安装器，终端会输出本机 Web 地址和首次登录凭据。
+在启用了 TUN/TAP 的 Linux VPS 上，以 `root` 在自己的目录中执行下面一条命令。需要 Bash 和 `curl`。
+
+### 源码版一键安装
+
+脚本先核对正式发行包的 SHA-256，再安装系统服务。需要无人值守安装时，可先执行 `export AIMILIVPN_NONINTERACTIVE=1`。
+
+```bash
+curl -fsSLO https://github.com/OpenMili/aimili-vpngate/releases/latest/download/install-source.sh && bash install-source.sh
+```
+
+### Docker 版一键安装
+
+需已安装 Docker Engine、支持 `up --wait` 的 Compose 插件和 `flock`。脚本拉取与发行版对应的镜像，将 Compose 配置写入 `/opt/aimilivpn-docker`。同一脚本部署的实例可以再次运行脚本升级，继续使用原数据卷。
+
+```bash
+curl -fsSLO https://github.com/OpenMili/aimili-vpngate/releases/latest/download/install-docker.sh && bash install-docker.sh
+```
+
+已有其他方式部署的 Docker 实例请用原 Compose 文件或原部署命令升级。使用一键脚本部署后，可在 `/opt/aimilivpn-docker/.env` 设置上游代理等选项。
 
 > [!TIP]
-> 安装前请在 VPS 控制面板启用 TUN/TAP，并确认 `/dev/net/tun` 存在。Web 默认在回环地址监听 TCP `8787`，远程访问可通过 SSH 端口转发。
+> Web 默认在回环地址监听 TCP `8787`，远程访问可通过 SSH 端口转发。Docker 首次登录凭据可用 `docker exec aimilivpn cat /data/ui_bootstrap.json` 查看。
 
 <a id="installation"></a>
 ## 完整安装
@@ -66,7 +84,7 @@ AimiliVPN 使用 Python 标准库管理 VPNGate 节点，提供节点获取与�
 - Windows 与 macOS 可作为代理客户端，但不能直接运行完整网关；Docker Desktop 也不等同于具备宿主机 TUN 能力的 Linux VPS。
 
 <a id="source-release"></a>
-### 方式一：一键源码安装
+### 方式一：手动安装源码发行包
 
 从 [GitHub Releases](https://github.com/OpenMili/aimili-vpngate/releases) 下载含新版安装器的发行包和同一发行版的 `sha256sums.txt`。在仅含这两个文件的目录中，以 `root` 核对后安装。首次部署需要先信任下载来源。
 

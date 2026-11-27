@@ -34,7 +34,19 @@ AimiliVPN uses Python's standard library to manage VPNGate nodes. It provides no
 <a id="quick-install"></a>
 ## Quick Install
 
-Use the [source Release installation steps](#source-release) on a supported Linux VPS. Run the installer as root. The terminal displays the local Web address and initial login credentials.
+On a Linux VPS with TUN/TAP enabled, run one command as root in your own directory. The Docker option requires Docker Engine, Compose with `up --wait`, and `flock`.
+
+**Source**
+
+```bash
+curl -fsSLO https://github.com/OpenMili/aimili-vpngate/releases/latest/download/install-source.sh && bash install-source.sh
+```
+
+**Docker**
+
+```bash
+curl -fsSLO https://github.com/OpenMili/aimili-vpngate/releases/latest/download/install-docker.sh && bash install-docker.sh
+```
 
 > [!TIP]
 > Enable TUN/TAP in the VPS control panel and verify that `/dev/net/tun` exists. The Web dashboard uses TCP `8787` by default; restrict firewall access to your own IP whenever possible.

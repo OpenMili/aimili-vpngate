@@ -35,6 +35,36 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def build_installers(root: Path, output_dir: Path, version: str) -> None:
+    if not re.fullmatch(r"[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}", version):
+        raise ValueError("安装脚本版本必须采用 X.Y.Z 格式")
+    compose = (root / "compose.yaml").read_text(encoding="utf-8").rstrip("\n")
+    compose, image_count = re.subn(
+        r"(?m)^    image: ghcr\.io/openmili/aimili-vpngate:[^\s]+$",
+        f"    image: ghcr.io/openmili/aimili-vpngate:{version}",
+        compose,
+    )
+    compose = re.sub(r"(?m)^    build:\n(?: {6}[^\n]*\n)+", "", compose)
+    if image_count != 1 or "AIMILIVPN_COMPOSE" in compose.splitlines() or "    build:" in compose.splitlines():
+        raise ValueError("Compose 配置无法生成固定版本的 Docker 安装脚本")
+
+    source = (root / "install.sh").read_text(encoding="utf-8")
+    channel = "\nbootstrap_release=latest\n"
+    if source.count(channel) != 1:
+        raise ValueError("无法为独立源码安装脚本锁定发行版")
+    docker = (root / "scripts" / "install-docker.sh.in").read_text(encoding="utf-8")
+    if docker.count("@COMPOSE_YAML@") != 1 or docker.count("@RELEASE_TAG@") != 1:
+        raise ValueError("Docker 安装模板中缺少发行版或 Compose 配置")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    source = source.replace(channel, f"\nbootstrap_release=v{version}\n")
+    checksum = hashlib.sha256((compose + "\n").encode("utf-8")).hexdigest()
+    managed_compose = f"# AimiliVPN managed compose {checksum}\n{compose}"
+    docker = docker.replace("@RELEASE_TAG@", f"v{version}").replace("@COMPOSE_YAML@", managed_compose)
+    (output_dir / "install-source.sh").write_bytes(source.encode("utf-8"))
+    (output_dir / "install-docker.sh").write_bytes(docker.encode("utf-8"))
+
+
 def build_archive(root: Path, output_dir: Path) -> Path:
     version = (root / "VERSION").read_text(encoding="utf-8").strip()
     if not re.fullmatch(r"[0-9]{1,9}\.[0-9]{1,9}\.[0-9]{1,9}", version):
@@ -71,6 +101,7 @@ def build_archive(root: Path, output_dir: Path) -> Path:
 
     checksum_lines = [f"{sha256(archive_path)}  {archive_path.name}"]
     checksum_path.write_bytes(("\n".join(checksum_lines) + "\n").encode("ascii"))
+    build_installers(root, output_dir, version)
     return archive_path
 
 

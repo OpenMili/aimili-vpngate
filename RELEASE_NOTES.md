@@ -8,9 +8,25 @@
 - **管理后台。** 新安装默认绑定 `127.0.0.1`，生成随机管理路径。密码保存为 PBKDF2 哈希。登录增加限流，改密后旧会话失效。远程管理可通过 SSH 端口转发。
 - **安装与更新。** 源码安装使用已校验的发行包。新版 `ml update` 支持指定正式标签，并在执行安装器之前校验 SHA‑256。OpenRC 服务与日志轮转也已更新。
 
-## 安装或从旧版升级
+## 一键安装
 
-在 Linux 上以 `root` 运行。把源码包和同一发行版的 `sha256sums.txt` 下载到一个新目录，校验通过后再安装。
+在启用了 TUN/TAP 的 Linux VPS 上以 `root` 执行。选择其中一段命令。
+
+**源码版**会校验发行包 SHA-256，安装系统服务并生成首次登录凭据。[下载 install-source.sh](https://github.com/OpenMili/aimili-vpngate/releases/download/v2.1.6/install-source.sh)
+
+```bash
+curl -fsSLO https://github.com/OpenMili/aimili-vpngate/releases/download/v2.1.6/install-source.sh && bash install-source.sh
+```
+
+**Docker 版**需已安装 Docker Engine 和 Compose 插件。配置保存在 `/opt/aimilivpn-docker`。已有其他方式部署的容器请用原部署配置升级。[下载 install-docker.sh](https://github.com/OpenMili/aimili-vpngate/releases/download/v2.1.6/install-docker.sh)
+
+```bash
+curl -fsSLO https://github.com/OpenMili/aimili-vpngate/releases/download/v2.1.6/install-docker.sh && bash install-docker.sh
+```
+
+## 手动安装或从旧版升级
+
+把源码包和同一发行版的 `sha256sums.txt` 下载到一个新目录，在 Linux 上以 `root` 校验并安装。
 
 ```bash
 sha256sum -c sha256sums.txt &&

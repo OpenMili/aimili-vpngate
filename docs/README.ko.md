@@ -33,7 +33,19 @@ AimiliVPN은 Python 표준 라이브러리로 VPNGate 노드를 관리하며 노
 <a id="quick-install"></a>
 ## 빠른 설치
 
-지원되는 Linux VPS에서 [릴리스 설치 단계](#source-release)에 따라 root로 설치합니다. 터미널에 로컬 Web 주소와 최초 로그인 정보가 표시됩니다.
+TUN/TAP이 활성화된 Linux VPS에서 root로 자신의 디렉터리에서 다음 명령 중 하나를 실행합니다. Docker 버전에는 Docker Engine, `up --wait`를 지원하는 Compose, `flock`이 필요합니다.
+
+**소스 버전**
+
+```bash
+curl -fsSLO https://github.com/OpenMili/aimili-vpngate/releases/latest/download/install-source.sh && bash install-source.sh
+```
+
+**Docker 버전**
+
+```bash
+curl -fsSLO https://github.com/OpenMili/aimili-vpngate/releases/latest/download/install-docker.sh && bash install-docker.sh
+```
 
 > [!TIP]
 > VPS 제어판에서 TUN/TAP을 활성화하고 `/dev/net/tun`이 존재하는지 확인하십시오. Web 기본 포트는 TCP `8787`이며 가능하면 자신의 IP만 허용하십시오.

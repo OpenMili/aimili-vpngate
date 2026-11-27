@@ -872,6 +872,24 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertNotIn("git fetch", install_text)
         self.assertNotIn("raw.githubusercontent.com", install_text)
 
+    def test_both_quick_install_commands_have_versioned_release_assets(self) -> None:
+        root = manager.ROOT_DIR
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        version = manager.APP_VERSION
+        with tempfile.TemporaryDirectory() as scratch:
+            output = Path(scratch)
+            build_release_archives.build_installers(root, output, version)
+            for name in ("install-source.sh", "install-docker.sh"):
+                url = f"https://github.com/OpenMili/aimili-vpngate/releases/latest/download/{name}"
+                self.assertIn(f"curl -fsSLO {url} && bash {name}", readme)
+                self.assertNotIn(b"\r", (output / name).read_bytes())
+            source = (output / "install-source.sh").read_text(encoding="utf-8")
+            docker = (output / "install-docker.sh").read_text(encoding="utf-8")
+            self.assertIn(f"\nbootstrap_release=v{version}\n", source)
+            self.assertIn(f"image: ghcr.io/openmili/aimili-vpngate:{version}\n", docker)
+            self.assertNotIn("    build:", docker)
+            self.assertNotIn("@COMPOSE_YAML@", docker)
+
     def test_release_package_verification_precedes_install(self) -> None:
         with tempfile.TemporaryDirectory() as scratch:
             root = Path(scratch)

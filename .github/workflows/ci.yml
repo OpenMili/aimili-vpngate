@@ -2,6 +2,7 @@ name: Validate changes
 
 on:
   pull_request:
+  workflow_dispatch:
   push:
     branches: [main]
 
@@ -23,3 +24,54 @@ jobs:
       - run: python -m unittest discover -s tests -v
       - run: bash -n install.sh && docker compose config --quiet
       - run: python scripts/build_release_archives.py --output-dir dist
+      - run: bash -n dist/install-source.sh && bash -n dist/install-docker.sh
+
+  smoke-published-installers:
+    # Exercise the real public downloads on disposable VMs after a release.
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        installer: [source, docker]
+    steps:
+      - name: Download and install the public release
+        env:
+          INSTALLER: ${{ matrix.installer }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP"
+          filename="install-$INSTALLER.sh"
+          curl -fsSLO "https://github.com/OpenMili/aimili-vpngate/releases/latest/download/$filename"
+          log=$(mktemp)
+          trap 'rm -f "$log"' EXIT
+          if ! sudo env AIMILIVPN_NONINTERACTIVE=1 bash "$filename" > "$log" 2>&1; then
+            grep -Ei 'error|failed|错误|失败|缺少' "$log" | tail -15 || true
+            exit 1
+          fi
+          if [[ $INSTALLER == source ]]; then
+            systemctl is-active --quiet aimilivpn.service
+            auth_file=/opt/aimilivpn/vpngate_data/ui_auth.json
+            before=$(sudo sha256sum "$auth_file")
+            # Exercise the original process-substitution command on an installed service.
+            sudo env AIMILIVPN_NONINTERACTIVE=1 bash -c 'bash <(curl -fsSL https://raw.githubusercontent.com/baoweise-bot/aimili-vpngate/main/install.sh)' > "$log" 2>&1
+            grep -Fq '管理服务已启动。' "$log"
+            test "$(sudo sha256sum "$auth_file")" = "$before"
+            systemctl is-active --quiet aimilivpn.service
+            secret_path=$(sudo python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["secret_path"])' "$auth_file")
+          else
+            test "$(docker inspect --format '{{.State.Health.Status}}' aimilivpn)" = healthy
+            docker exec aimilivpn test -s /data/ui_bootstrap.json
+            volume=$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' aimilivpn)
+            test -n "$volume"
+            docker exec aimilivpn touch /data/installer-smoke-marker
+            sudo bash "$filename" >> "$log" 2>&1
+            docker exec aimilivpn test -f /data/installer-smoke-marker
+            secret_path=$(docker exec aimilivpn python3 -c 'import json; print(json.load(open("/data/ui_auth.json"))["secret_path"])')
+            test "$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' aimilivpn)" = "$volume"
+          fi
+          test -n "$secret_path"
+          curl --noproxy '*' -fsS "http://127.0.0.1:8787/$secret_path/" -o "$RUNNER_TEMP/login.html"
+          grep -Fq 'type="password"' "$RUNNER_TEMP/login.html"
