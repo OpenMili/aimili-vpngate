@@ -489,7 +489,8 @@ def provider_json(request: urllib.request.Request, limit: int = 65536) -> Any:
             delay = 86400
         elif error.code >= 500:
             delay = 30
-        error.close()
+        if error.fp is not None:
+            error.close()
     except OSError:
         delay = 30
     except (ValueError, RecursionError):
