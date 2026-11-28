@@ -177,10 +177,12 @@ docker exec aimilivpn cat /data/ui_bootstrap.json
 ### 2. 获取并连接节点
 
 1. 打开安装器给出的地址并登录。面板会自动连接首个检测通过的节点，同时显示其余节点的检测进度。
-2. 按国家筛选节点，并使用“测试”检查本机实测延迟与可用性。
-3. 点击目标节点的“切换”；目标预检失败时，程序会尽量保留当前可用连接。
-4. 根据需要选择智能自动、固定国家或固定 IP 模式。
-5. 在状态区域确认 VPN 已连接，并核对当前出口 IP。
+2. 在节点列表中切换已通过检测的节点。点节点名称可以看入口地址、实测延迟、运营商和 IP 类型，也可以收藏或复测。
+3. 用「筛选」按国家、状态、IP 类型或收藏查看当前列表。后台获取哪些国家的节点由「管理 → 订阅范围」单独设置。
+4. 在「管理 → 代理与路由」选择自动、仅用收藏、固定地区或固定 IP，保存后生效。
+5. 首页显示服务器本机的代理地址和经代理实测的出口 IP。需要重新测试出口时，打开「管理 → 网关自检」。
+
+节点入口和实际出口分别查询。默认通过 [IPQuery](https://ipquery.io/) 的免费 HTTPS 接口获取归属资料，失败时尝试 [ipapi.is 匿名接口](https://ipapi.is/free-tier.html)。类型证据不足时，再按 ASN 查询 GitHub 上 [ipverse/as-ip-blocks](https://github.com/ipverse/as-ip-blocks) 的公开分类。运营商网络标为「疑似住宅 IP」，无法判断时显示「未能确认」。查询在后台分批进行，成功结果缓存 7 天，临时失败会重试。公开接口仅接收待查询的公网 IP，GitHub 查询使用 ASN。
 
 官方接口失败时，程序会尝试 [GitHub Pages 备用订阅](https://openmili.github.io/aimili-vpngate/vpngate.csv)，随后读取本地快照。Actions 按每 15 分钟调度，镜像实际更新时间以[快照元数据](https://openmili.github.io/aimili-vpngate/vpngate.meta.json)中的 `generated_at_iso` 为准。GitHub 可能延迟执行定时任务。客户端会提示超过 30 分钟的快照，备用订阅里的节点仍需检测。
 

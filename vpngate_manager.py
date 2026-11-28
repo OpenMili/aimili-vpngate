@@ -174,7 +174,7 @@ UPDATE_COMMAND = (
 )
 
 ROOT_DIR = Path(sys.executable).resolve().parent if globals().get("__compiled__") else Path(__file__).resolve().parent
-DEFAULT_APP_VERSION = "2.1.8"
+DEFAULT_APP_VERSION = "2.1.9"
 try:
     _version_text = (ROOT_DIR / "VERSION").read_text(encoding="utf-8").strip()
 except OSError:
@@ -544,8 +544,14 @@ def set_state(**updates: Any) -> None:
     # Keep the read-modify-write transaction atomic across background threads.
     with lock:
         state = get_state()
+        new_exit = updates.get("proxy_ip", state.get("proxy_ip"))
+        exit_changed = new_exit != state.get("proxy_ip") or (updates.get("proxy_ok") and not state.get("proxy_ok"))
+        if exit_changed or updates.get("proxy_ok") is False:
+            state.pop("exit_ip_info", None)
         state.update(updates)
         write_json(STATE_FILE, state)
+        if exit_changed and state.get("proxy_ok"):
+            ip_enrichment_wakeup.set()
 
 def read_nodes() -> list[dict[str, Any]]:
     raw = read_json(NODES_FILE, [])
@@ -1702,46 +1708,53 @@ def enrich_stored_nodes() -> int:
     """Enrich every listed IP, then merge only metadata into the latest state."""
     with lock:
         snapshot = read_nodes()
-    if not snapshot:
-        return 0
-
-    vpn_utils.enrich_ip_info(snapshot)
-    enriched_by_id = {
-        str(node.get("id") or ""): node
-        for node in snapshot
-        if node.get("id") and node.get("ip_type")
-    }
-    if not enriched_by_id:
-        return 0
-
+        initial = read_json(STATE_FILE, {})
+    exit_ip = vpn_utils.public_ip(initial.get("proxy_ip")) if initial.get("proxy_ok") else ""
+    if exit_ip:
+        snapshot.insert(0, {"ip": exit_ip})
     changed = 0
-    with lock:
-        current_nodes = read_nodes()
-        for current in current_nodes:
-            enriched = enriched_by_id.get(str(current.get("id") or ""))
-            if not enriched:
+    # Publish small groups while the rest are looking up. Network I/O stays outside the state lock.
+    for offset in range(0, len(snapshot), 8):
+        if service_stopping.is_set():
+            break
+        group = snapshot[offset:offset + 8]
+        vpn_utils.enrich_ip_info(group)
+        by_id = {node["id"]: node for node in group if node.get("id") and node.get("ip_type")}
+        with lock:
+            if exit_ip and offset == 0:
+                latest = read_json(STATE_FILE, {})
+                info = {key: group[0][key] for key in ("ip", *IP_ENRICHMENT_FIELDS) if key in group[0]}
+                if latest.get("proxy_ok") and latest.get("proxy_ip") == exit_ip and latest.get("exit_ip_info") != info:
+                    set_state(exit_ip_info=info)
+            if not by_id:
                 continue
-            for field in IP_ENRICHMENT_FIELDS:
-                new_value = enriched.get(field, "")
-                if current.get(field, "") != new_value:
-                    current[field] = new_value
-                    changed += 1
-        if changed:
-            write_json(NODES_FILE, sort_all_nodes(current_nodes))
-            verified_node_wakeup.set()
+            current_nodes = read_nodes()
+            updated = 0
+            for node in current_nodes:
+                incoming = by_id.get(node.get("id"))
+                if not incoming or incoming.get("ip") != node.get("ip"):
+                    continue
+                for key in IP_ENRICHMENT_FIELDS:
+                    if key in incoming and node.get(key) != incoming[key]:
+                        node[key] = incoming[key]
+                        updated += 1
+            if updated:
+                write_json(NODES_FILE, sort_all_nodes(current_nodes))
+                verified_node_wakeup.set()
+                changed += updated
     return changed
 
+
 def ip_enrichment_loop() -> None:
-    while True:
-        nodes_exist = bool(read_nodes())
-        if nodes_exist:
-            try:
-                enrich_stored_nodes()
-            except Exception as exc:
-                print(f"[IP 类型] 后台批量识别失败: {exc}", flush=True)
-                log_to_json("WARNING", "Main", f"后台批量识别 IP 类型失败: {exc}")
-        ip_enrichment_wakeup.wait(300 if nodes_exist else 5)
+    while not service_stopping.is_set():
         ip_enrichment_wakeup.clear()
+        try:
+            enrich_stored_nodes()
+        except Exception as exc:
+            log_to_json("WARNING", "Main", f"后台识别 IP 类型失败: {exc}")
+        if not service_stopping.is_set():
+            ip_enrichment_wakeup.wait(300)
+
 
 def apply_routing_filters(
     nodes: list[dict[str, Any]],
@@ -1932,7 +1945,6 @@ def probe_candidate(n_info: dict[str, Any]) -> dict[str, Any]:
     config_text = n_info.get("config_text") or ""
     h = str(n_info.get("remote_host") or n_info.get("ip"))
     p = parse_int(n_info.get("remote_port"))
-    fallback_ping = parse_int(n_info.get("ping"))
 
     temp_path = test_config_path(node_id)
     try:
@@ -1947,7 +1959,7 @@ def probe_candidate(n_info: dict[str, Any]) -> dict[str, Any]:
             "probed_at": time.time(),
         }
 
-    latency = vpn_utils.ping_latency_ms(h, p, fallback_ping)
+    latency = vpn_utils.ping_latency_ms(h, p)
     tun_idx = None
     try:
         tun_idx = get_free_test_index()
@@ -2278,8 +2290,7 @@ def connect_node(node_id: str, *, automatic: bool = False) -> str:
         try:
             ip = node.get("ip") or node.get("remote_host")
             port = parse_int(node.get("remote_port"))
-            fallback = parse_int(node.get("ping"))
-            latency = vpn_utils.ping_latency_ms(ip, port, fallback)
+            latency = vpn_utils.ping_latency_ms(ip, port)
             if latency > 0:
                 last_active_latency = latency
         except Exception:
@@ -2529,6 +2540,7 @@ LOGIN_HTML = r"""<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="icon" href="data:,">
   <title>AimiliVPN - 安全登录</title>
   <style>
     :root {
@@ -2804,6 +2816,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="data:,">
   <title>AimiliVPN 节点池管理系统</title>
   <style>
     :root {
@@ -2840,329 +2853,59 @@ INDEX_HTML = r"""<!doctype html>
       -webkit-font-smoothing: antialiased;
     }
 
-    header {
-      padding: 16px 32px;
-      background: rgba(11, 15, 25, 0.97);
-      border-bottom: 1px solid var(--border-color);
-      display: flex;
-      justify-content: space-between;
-      gap: 16px;
-      align-items: center;
-      position: sticky;
-      top: 0;
-      z-index: 100;
+    [hidden] { display: none !important; }
+    body { background-image: none; }
+    button, select, input { font: inherit; }
+    button, .panel-control {
+      display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+      min-height: 36px; padding: 0 12px; box-sizing: border-box; border-radius: 7px;
+      border: 1px solid var(--border-color); background: #1a2435; color: var(--text-primary);
+      font-size: 13px; font-weight: 600; cursor: pointer;
     }
-
-    .brand {
-      display: flex;
-      flex-direction: column;
+    button:hover:not(:disabled), .panel-control:hover { background: #27344b; }
+    button:disabled { color: #909bad; cursor: not-allowed; }
+    :is(button, summary, a, select, input):focus-visible { outline: 2px solid #a5b4fc; outline-offset: 2px; }
+    .btn-primary { background: #494dc1; color: white; }
+    .btn-primary:hover:not(:disabled) { background: #555acc; }
+    header { background: #101621; border-bottom: 1px solid var(--border-color); }
+    .topbar, main { max-width: 1120px; margin: 0 auto; padding-inline: clamp(12px, 3.5vw, 40px); }
+    .topbar { position: relative; z-index: 2; height: 64px; display: flex; align-items: center; justify-content: space-between; }
+    .brand { display: flex; gap: 10px; align-items: center; }
+    h1 { font-size: 20px; margin: 0; letter-spacing: -.02em; }
+    .brand svg { width: 24px; color: #a5b4fc; }
+    .brand span { padding-left: 12px; border-left: 1px solid #384354; font-size: 13px; color: #b1bbca; }
+    main { padding-block: 24px 40px; }
+    h2 { font-size: 20px; margin: 0; }
+    .connection, .node-panel { background: #141c29; border: 1px solid var(--border-color); border-radius: 12px; }
+    .connection {
+      display: grid; grid-template-columns: minmax(140px, .9fr) minmax(150px, 1.1fr) minmax(190px, 1.2fr) auto;
+      align-items: center; gap: 12px 24px; padding: 20px 24px; margin-bottom: 20px;
     }
-
-    h1 {
-      font-size: 20px;
-      font-weight: 700;
-      margin: 0;
-      background: linear-gradient(135deg, #a5b4fc 0%, #6366f1 100%);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      letter-spacing: -0.5px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .status {
-      font-size: 13px;
-      color: var(--text-secondary);
-      margin-top: 4px;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-
-    .status-dot {
-      width: 8px;
-      height: 8px;
-      border-radius: 50%;
-      background: var(--success);
-      box-shadow: 0 0 10px var(--success);
-      display: inline-block;
-    }
-
-    .btn-group {
-      display: flex;
-      gap: 12px;
-    }
-
-    button, .btn-telegram {
-      height: 38px;
-      border: 1px solid var(--border-color);
-      border-radius: 8px;
-      padding: 0 16px;
-      font-weight: 600;
-      font-size: 13px;
-      cursor: pointer;
-      transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      gap: 6px;
-      background: rgba(255, 255, 255, 0.04);
-      color: var(--text-primary);
-      white-space: nowrap;
-      text-decoration: none;
-      box-sizing: border-box;
-    }
-
-    button:hover {
-      background: rgba(255, 255, 255, 0.08);
-      border-color: rgba(255, 255, 255, 0.15);
-      transform: translateY(-1px);
-    }
-
-    .btn-telegram {
-      background: rgba(43, 162, 223, 0.15);
-      border: 1px solid rgba(43, 162, 223, 0.3);
-      color: #2ba2df;
-    }
-
-    .btn-telegram:hover {
-      background: rgba(43, 162, 223, 0.25);
-      border-color: rgba(43, 162, 223, 0.5);
-      color: #2ba2df;
-      transform: translateY(-1px);
-    }
-
-    .btn-primary {
-      background: var(--primary-gradient);
-      color: white;
-      border: none;
-      box-shadow: 0 4px 12px rgba(99, 102, 241, 0.2);
-    }
-
-    .btn-primary:hover {
-      background: var(--primary-hover);
-      box-shadow: 0 6px 16px rgba(99, 102, 241, 0.35);
-    }
-
-    .btn-danger {
-      background: var(--danger-gradient);
-      color: white;
-      border: none;
-      box-shadow: 0 4px 12px rgba(244, 63, 94, 0.2);
-    }
-
-    .btn-danger:hover {
-      opacity: 0.95;
-      box-shadow: 0 6px 16px rgba(244, 63, 94, 0.35);
-    }
-
-    button:disabled {
-      opacity: 0.4;
-      cursor: not-allowed;
-      transform: none !important;
-      box-shadow: none !important;
-    }
-
-    main {
-      padding: 24px 32px;
-      max-width: 1400px;
-      margin: 0 auto;
-    }
-
-    .active-card {
-      background: linear-gradient(135deg, rgba(99, 102, 241, 0.12) 0%, rgba(79, 70, 229, 0.04) 100%);
-      border: 1px solid rgba(99, 102, 241, 0.25);
-      border-radius: 16px;
-      padding: 24px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      gap: 24px;
-      box-shadow: 0 8px 32px rgba(99, 102, 241, 0.12);
-      transition: all 0.3s ease;
-      width: 100%;
-      box-sizing: border-box;
-    }
-    
-    .active-card-info {
-      display: flex;
-      align-items: center;
-      gap: 20px;
-      flex-wrap: wrap;
-    }
-    
-    .active-card-details {
-      display: flex;
-      flex-direction: column;
-      gap: 6px;
-    }
-    
-    .active-card-title {
-      font-size: 14px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 1px;
-      color: #a5b4fc;
-      display: flex;
-      align-items: center;
-      gap: 8px;
-    }
-    
-    .active-card-value {
-      font-size: 24px;
-      font-weight: 700;
-      color: var(--text-primary);
-    }
-    
-    .active-card-meta {
-      display: flex;
-      gap: 16px;
-      font-size: 13px;
-      color: var(--text-secondary);
-      flex-wrap: wrap;
-    }
-
-    .active-card-meta span strong {
-      color: var(--text-primary);
-    }
-
-    .stats {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-      gap: 16px;
-      margin-bottom: 24px;
-    }
-
-    .stat {
-      background: var(--bg-surface);
-      border: 1px solid var(--border-color);
-      border-radius: 12px;
-      padding: 20px;
-      transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
-      position: relative;
-      overflow: hidden;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-    }
-
-    .stat:hover {
-      background: var(--bg-surface-hover);
-      border-color: var(--border-color-hover);
-      transform: translateY(-2px);
-      box-shadow: 0 8px 24px rgba(99, 102, 241, 0.1);
-    }
-
-    .stat-info {
-      display: flex;
-      flex-direction: column;
-    }
-
-    .stat strong {
-      font-size: 32px;
-      font-weight: 700;
-      display: block;
-      margin-bottom: 4px;
-      background: linear-gradient(135deg, #ffffff 0%, #cbd5e1 100%);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-    }
-
-    .stat span {
-      font-size: 13px;
-      color: var(--text-secondary);
-      font-weight: 500;
-    }
-
-    .stat-icon-wrapper {
-      width: 44px;
-      height: 44px;
-      border-radius: 10px;
-      background: rgba(255, 255, 255, 0.04);
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      border: 1px solid rgba(255, 255, 255, 0.06);
-    }
-
-    .stat-icon {
-      width: 22px;
-      height: 22px;
-      color: var(--primary);
-    }
-
-    .stat:nth-child(2) .stat-icon { color: var(--warning); }
-    .stat:nth-child(3) .stat-icon { color: var(--success); }
-
-    /* New style additions */
-    .header-badge-link {
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-      padding: 4px 10px;
-      background: rgba(255, 255, 255, 0.05);
-      border: 1px solid var(--border-color);
-      border-radius: 6px;
-      color: var(--text-secondary);
-      text-decoration: none;
-      font-size: 12px;
-      font-weight: 600;
-      transition: all 0.2s ease;
-      height: 24px;
-      box-sizing: border-box;
-    }
-    .header-badge-link:hover {
-      background: rgba(255, 255, 255, 0.1);
-      border-color: var(--border-color-hover);
-      color: var(--text-primary);
-      transform: translateY(-1px);
-    }
-    .flex-row-container {
-      display: flex;
-      gap: 20px;
-      flex-wrap: wrap;
-      margin-bottom: 24px;
-    }
-    .flex-row-container > * {
-      flex: 1;
-      min-width: 320px;
-      margin-bottom: 0 !important;
-    }
-    .vps-recommend-tab {
-      position: fixed;
-      right: 0;
-      top: 50%;
-      transform: translateY(-50%);
-      width: 38px;
-      height: auto;
-      min-height: 150px;
-      background: var(--primary-gradient);
-      border: 1px solid var(--border-color-hover);
-      border-right: none;
-      border-radius: 8px 0 0 8px;
-      padding: 16px 6px;
-      color: white;
-      font-weight: 700;
-      font-size: 13px;
-      line-height: 1.4;
-      text-align: center;
-      cursor: pointer;
-      z-index: 999;
-      box-shadow: -4px 0 20px rgba(99, 102, 241, 0.3);
-      transition: all 0.3s ease;
-      writing-mode: vertical-rl;
-      text-orientation: mixed;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      gap: 4px;
-    }
-    .vps-recommend-tab:hover {
-      padding-right: 10px;
-      box-shadow: -4px 0 25px rgba(99, 102, 241, 0.5);
-    }
-
+    .eyebrow { display: block; font-size: 13px; color: #a7b3c6; margin: 0 0 6px; }
+    .connection h2 { display: flex; gap: 10px; align-items: center; line-height: 1.35; }
+    .connection h2::before { content: ""; width: 10px; height: 10px; flex: none; border-radius: 50%; background: #8996ab; }
+    .connection[data-tone="ok"] h2::before { background: #47d4a3; }
+    .connection[data-tone="busy"] h2::before { background: #f3bb62; }
+    .connection[data-tone="error"] h2::before { background: #fa8395; }
+    .connection-value { font-size: 14px; color: #e2e7f0; overflow-wrap: anywhere; }
+    .connection .address, .node-address { font-family: ui-monospace, Consolas, monospace; font-variant-numeric: tabular-nums; }
+    .connection-note { grid-column: 1/-1; margin: 0; color: #b0bfd2; font-size: 13px; overflow-wrap: anywhere; }
+    .quiet { background: transparent; color: #c5cede; }
+    .node-head { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 18px 20px 8px; }
+    .node-head h2 { margin-right: auto; }
+    .scan { padding: 0 20px 15px; font-size: 13px; color: #b0bfd2; font-variant-numeric: tabular-nums; }
+    .scan progress { display: block; width: 100%; height: 4px; margin-top: 10px; accent-color: #7d8cf5; }
+    .scan p { margin: 5px 0 0; overflow-wrap: anywhere; color: #e7bd88; }
+    .scan progress::-webkit-progress-bar { background: #2b3547; border-radius: 3px; }
+    .scan progress::-webkit-progress-value { background: #8592f7; border-radius: 3px; }
+    .scan progress { appearance: none; border: 0; background: #2b3547; border-radius: 3px; }
+    .node-count { display: inline-block; margin-left: 7px; color: #a7b3c6; font-size: 14px; font-weight: 500; }
+    .toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; padding: 0 20px 16px; }
+    .toolbar select { height: 42px; padding: 0 10px; background: #182132; color: var(--text-primary); border: 1px solid #344054; border-radius: 7px; font-size: 14px; }
+    .filter-check { display: inline-flex; gap: 5px; align-items: center; font-size: 14px; min-height: 36px; }
+    .filter-check input { accent-color: #797ee8; }
+    .node-panel button[aria-expanded="true"], .node-panel .has-filters { color: #c1c7ff; border-color: #666caa; }
+    .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }
     .vps-links {
       display: grid;
       grid-template-columns: repeat(2, 1fr);
@@ -3263,62 +3006,6 @@ INDEX_HTML = r"""<!doctype html>
     .forum-link:hover {
       color: #a5b4fc;
       text-decoration: underline;
-    }
-
-    .toolbar {
-      position: relative;
-      z-index: 50;
-      background: var(--bg-surface);
-      border: 1px solid var(--border-color);
-      border-radius: 12px;
-      padding: 16px;
-      margin-bottom: 24px;
-      display: flex;
-      gap: 16px;
-      flex-wrap: wrap;
-      align-items: center;
-    }
-
-    .toolbar select {
-      width: 180px;
-      height: 42px;
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px solid var(--border-color);
-      border-radius: 8px;
-      padding: 0 12px;
-      color: var(--text-primary);
-      font-family: inherit;
-      font-size: 14px;
-      outline: none;
-      transition: all 0.2s ease;
-      cursor: pointer;
-    }
-
-    .toolbar select:focus {
-      border-color: var(--primary);
-      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
-      background: #0f172a;
-    }
-
-    .toolbar > input {
-      flex: 1;
-      min-width: 250px;
-      height: 42px;
-      background: rgba(255, 255, 255, 0.03);
-      border: 1px solid var(--border-color);
-      border-radius: 8px;
-      padding: 0 16px;
-      color: var(--text-primary);
-      font-family: inherit;
-      font-size: 14px;
-      transition: all 0.2s ease;
-    }
-
-    .toolbar > input:focus {
-      outline: none;
-      border-color: var(--primary);
-      box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.2);
-      background: rgba(15, 23, 42, 0.8);
     }
 
     .country-filter {
@@ -3486,66 +3173,36 @@ INDEX_HTML = r"""<!doctype html>
       outline: none;
     }
 
-    .table-wrapper {
-      background: var(--bg-surface);
-      border: 1px solid var(--border-color);
-      border-radius: 16px;
-      overflow: hidden;
-      box-shadow: 0 8px 32px rgba(0, 0, 0, 0.2);
-    }
-
-    .table-container {
-      overflow-x: auto;
-      -webkit-overflow-scrolling: touch;
-    }
-
-    table {
-      width: 100%;
-      min-width: 1120px;
-      border-collapse: collapse;
-      text-align: left;
-      table-layout: fixed;
-    }
-
-    th, td {
-      padding: 14px 20px;
-      border-bottom: 1px solid var(--border-color);
-      font-size: 14px;
-    }
-
-    th {
-      background: rgba(17, 24, 39, 0.4);
-      font-size: 12px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.8px;
-      color: var(--text-secondary);
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    tr {
-      transition: background 0.2s ease;
-    }
-
-    tr:hover {
-      background: rgba(255, 255, 255, 0.015);
-    }
-
-    .active-row {
-      background: var(--active-row-bg) !important;
-      outline: 2px solid var(--success) !important;
-      outline-offset: -2px;
-      position: relative;
-      z-index: 5;
-    }
-
-    .active-row td {
-      border-bottom: 1px solid var(--active-row-border);
-      border-top: 1px solid var(--active-row-border);
-    }
-
+    .node-table { width: 100%; table-layout: fixed; border-collapse: collapse; }
+    .node-table th, .node-table td { text-align: left; padding: 8px 16px; border-top: 1px solid var(--border-color); }
+    .node-table thead th { position: sticky; top: 0; z-index: 1; font-size: 12px; font-weight: 500; color: #a9b6c9; background: #172130; }
+    .node-table th:first-child, .node-table td:first-child { padding-left: 20px; }
+    .node-table th:last-child, .node-table td:last-child { text-align: right; padding-right: 20px; }
+    .node-col { width: 45%; }
+    .state-col { width: 20%; }
+    .latency-col { width: 19%; }
+    .node-table .active-row { background: #14252a; }
+    .node-table .empty-row { padding-block: 30px; color: var(--text-secondary); text-align: center; font-size: 14px; }
+    .node-link { display: flex; flex-direction: column; align-items: start; gap: 3px; max-width: 100%; min-height: 42px; padding: 3px 0; border: 0; background: transparent; text-align: left; }
+    .node-link:hover:not(:disabled) { background: transparent; color: #c1c7ff; }
+    .node-name { font-size: 15px; font-weight: 600; overflow-wrap: anywhere; }
+    .node-name::after { content: "›"; margin-left: 6px; color: #939fb2; }
+    .node-address { font-size: 12px; font-weight: 400; color: #a5b2c6; overflow-wrap: anywhere; }
+    .switch-btn { min-width: 64px; background: #494dc1; color: white; }
+    .switch-btn:hover:not(:disabled) { background: #5c60d4; }
+    .switch-btn:disabled { background: transparent; border-color: #323b4c; }
+    .current-marker { color: #9daebf; padding-right: 10px; }
+    .detail-list { display: grid; grid-template-columns: auto 1fr; gap: 12px 20px; font-size: 14px; }
+    .detail-list dt { color: var(--text-secondary); }
+    .detail-list dd { margin: 0; overflow-wrap: anywhere; }
+    .dialog-head, .dialog-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+    .dialog-head h3 { margin: 0; font-size: 18px; }
+    .dialog-actions { justify-content: flex-end; margin-top: 20px; }
+    .about-links { display: flex; gap: 12px; flex-wrap: wrap; margin: 16px 0; }
+    .about-links a { color: #b5bfff; }
+    .project-links summary { color: var(--text-secondary); cursor: pointer; padding-block: 8px; }
+    .pagination-container { padding: 12px 20px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px; border-top: 1px solid var(--border-color); color: #a9b6c9; font-size: 13px; }
+    .page-buttons { display: flex; align-items: center; gap: 6px; }
     .badge {
       padding: 4px 10px;
       border-radius: 6px;
@@ -3601,69 +3258,6 @@ INDEX_HTML = r"""<!doctype html>
       border-color: rgba(59, 130, 246, 0.24);
     }
 
-    .current-badge {
-      background: rgba(99, 102, 241, 0.15);
-      color: #818cf8;
-      border-color: rgba(99, 102, 241, 0.3);
-    }
-
-    .table-actions {
-      display: flex;
-      gap: 8px;
-      align-items: center;
-      white-space: nowrap;
-    }
-
-    .connect-btn {
-      background: transparent;
-      color: #818cf8;
-      border: 1px solid rgba(99, 102, 241, 0.4);
-      border-radius: 6px;
-      padding: 0 12px;
-      height: 30px;
-      font-size: 12px;
-      font-weight: 600;
-      transition: all 0.2s ease;
-      cursor: pointer;
-    }
-
-    .connect-btn:hover:not(:disabled) {
-      background: var(--primary-gradient);
-      color: white;
-      border-color: transparent;
-      box-shadow: 0 4px 10px rgba(99, 102, 241, 0.3);
-    }
-
-    .connect-btn:disabled {
-      opacity: 0.3;
-      cursor: not-allowed;
-    }
-
-    .test-btn {
-      background: transparent;
-      color: #34d399;
-      border: 1px solid rgba(16, 185, 129, 0.4);
-      border-radius: 6px;
-      padding: 0 12px;
-      height: 30px;
-      font-size: 12px;
-      font-weight: 600;
-      cursor: pointer;
-      transition: all 0.2s ease;
-    }
-
-    .test-btn:hover:not(:disabled) {
-      background: var(--success-gradient);
-      color: white;
-      border-color: transparent;
-      box-shadow: 0 4px 10px rgba(16, 185, 129, 0.3);
-    }
-
-    .test-btn:disabled {
-      opacity: 0.4;
-      cursor: not-allowed;
-    }
-
     .mono {
       font-family: 'JetBrains Mono', Consolas, monospace;
       font-size: 13px;
@@ -3705,66 +3299,43 @@ INDEX_HTML = r"""<!doctype html>
       opacity: 0.8;
     }
 
-    @media (max-width: 768px) {
-      header {
-        flex-direction: column;
-        align-items: flex-start;
-        padding: 16px 20px;
-        position: static;
-      }
-      .btn-group {
-        width: 100%;
-        margin-top: 12px;
-        gap: 8px;
-        flex-wrap: wrap;
-      }
-      .btn-group > button,
-      .btn-group > .btn-telegram,
-      .btn-group > .dropdown {
-        flex: 1 1 calc(50% - 4px);
-        min-width: 0;
-      }
-      .btn-group .dropdown {
-        display: flex;
-      }
-      .btn-group .dropdown button {
-        width: 100%;
-        flex: 1;
-      }
-      #github_dropdown {
-        left: 0;
-        right: auto;
-        width: min(280px, calc(100vw - 40px));
-        min-width: 0;
-      }
-      main {
-        padding: 16px 20px;
-      }
-      .active-card {
-        flex-direction: column;
-        align-items: flex-start;
-        gap: 16px;
-      }
-      .active-card button {
-        width: 100%;
-      }
-      button, .btn-telegram {
-        min-height: 44px;
-      }
-      .input-field,
-      .toolbar select,
-      .toolbar > input {
-        font-size: 16px;
-      }
+    @media (max-width: 720px) {
+      .topbar { height: 52px; }
+      main { padding-block: 12px 24px; }
+      .connection { grid-template-columns: minmax(0, 1fr) auto; gap: 10px 12px; padding: 14px 16px; margin-bottom: 12px; }
+      .connection-state { grid-column: 1; grid-row: 1; }
+      #disconnect_btn { grid-column: 2; grid-row: 1; }
+      .connection-field { grid-column: 1/-1; display: flex; gap: 12px; align-items: baseline; }
+      .connection-field .eyebrow { margin: 0; flex: 0 0 auto; }
+      .node-head { padding: 12px 12px 6px; }
+      .node-head h2 { font-size: 18px; }
+      .node-head button, .topbar button, .switch-btn, .page-buttons button { min-height: 44px; }
+      .scan { padding: 0 12px 12px; }
+      .toolbar { display: grid; grid-template-columns: 1fr 1fr; padding: 0 12px 12px; }
+      .country-filter { grid-column: 1; grid-row: 1; width: 100%; }
+      .country-filter-panel { width: min(280px, calc(100vw - 68px)); }
+      .node-col { width: 39%; }
+      .state-col { width: 20%; }
+      .latency-col { width: 22%; }
+      .node-table th, .node-table td { padding: 6px 3px; }
+      .node-table th:first-child, .node-table td:first-child { padding-left: 10px; }
+      .node-table th:last-child, .node-table td:last-child { padding-right: 10px; }
+      .node-table .badge { padding: 3px 5px; white-space: nowrap; }
+      .switch-btn { min-width: 44px; padding: 0 8px; }
+      .node-link { min-height: 44px; }
+      .node-address { font-size: 11px; }
+      .pagination-container { padding: 10px; }
+      .page-buttons button { padding-inline: 8px; }
+      .modal { padding: 12px !important; }
+      .modal-content { width: 100% !important; padding: 16px !important; }
     }
-    
     /* Admin dropdown styles */
     .dropdown {
       position: relative;
       display: inline-block;
     }
     .dropdown-content {
-      display: none;
+      display: block;
       position: absolute;
       right: 0;
       margin-top: 6px;
@@ -3929,7 +3500,7 @@ INDEX_HTML = r"""<!doctype html>
     /* Option Card Styles for Proxy/Routing Settings */
     .option-group {
       display: grid;
-      grid-template-columns: repeat(3, 1fr);
+      grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
       gap: 10px;
       margin-top: 6px;
     }
@@ -3998,94 +3569,42 @@ INDEX_HTML = r"""<!doctype html>
 </head>
 <body>
 <header>
-  <div class="brand">
-    <h1>
-      <svg xmlns="http://www.w3.org/2000/svg" style="width:24px; height:24px; color:#818cf8;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg>
-      AimiliVPN 节点管理系统
-    </h1>
-    <div id="status" class="status" role="status" aria-live="polite"><span class="status-dot"></span>服务加载中...</div>
-  </div>
-  <div class="btn-group">
-
-    <div class="dropdown">
-      <button id="github_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="github_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
-        <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.012 8.012 0 0 0 16 8c0-4.42-3.58-8-8-8z"/></svg>
-        <span id="github_version_label">V2.1.8 正式版</span>
-        <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
-      </button>
-      <div id="github_dropdown" class="dropdown-content github-dropdown">
-        <div class="version-current">
-          <div id="current_version_label" class="version-current-label">V2.1.8 正式版</div>
-          <div id="deployment_mode_label" class="version-current-meta">Python 源码部署 · 更新通道：main</div>
-        </div>
-        <button id="check_update_btn" type="button" onclick="checkForUpdate(event)">
-          <svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
-          检测更新
-        </button>
-        <a href="https://github.com/OpenMili/aimili-vpngate/tree/main" target="_blank" rel="noopener noreferrer">GitHub main 主分支</a>
-        <a id="latest_release_link" href="https://github.com/OpenMili/aimili-vpngate/releases/latest" target="_blank" rel="noopener noreferrer">下载最新正式版</a>
-        <div id="update_check_status" class="update-check-status" role="status" aria-live="polite">点击“检测更新”查询 GitHub 最新正式版。</div>
-      </div>
-    </div>
-    <a href="https://t.me/arestemple" target="_blank" rel="noopener noreferrer" class="btn-telegram">
-      <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" fill="currentColor" viewBox="0 0 16 16" style="vertical-align: middle; margin-right: 4px;"><path d="M16 8A8 8 0 1 1 0 8a8 8 0 0 1 16 0zM8.287 5.906c-.778.324-2.334.994-4.666 2.01-.378.15-.577.298-.595.442-.03.243.275.339.69.47l.175.055c.408.133.958.288 1.243.294.26.006.549-.1.868-.32 2.179-1.471 3.304-2.214 3.374-2.23.05-.012.12-.026.166.016.047.041.042.12.037.141-.03.129-1.227 1.241-1.846 1.817-.193.18-.33.307-.358.336-.063.065-.129.13-.19.193-.34.347-.597.609-.043.974.265.175.474.319.684.457.228.15.457.301.765.503.074.049.143.098.207.143.297.206.58.404.916.373.195-.018.398-.2.502-.754.25-1.332.74-4.22.842-5.281.01-.088.001-.22-.103-.312-.104-.092-.252-.09-.323-.087a1.52 1.52 0 0 0-.254.04z"/></svg>
-      Telegram
-    </a>
-    <button id="refresh" class="btn-primary" style="background: var(--success-gradient);">
-      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>
-      更新节点
-    </button>
-    <div class="dropdown">
-      <button id="admin_btn" class="btn-primary" type="button" aria-expanded="false" aria-controls="admin_dropdown" style="background: rgba(255, 255, 255, 0.08); border: 1px solid var(--border-color); color: var(--text-primary);">
-        <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z" /></svg>
-        管理员
-        <svg xmlns="http://www.w3.org/2000/svg" style="width:12px; height:12px; margin-left: 2px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="3"><path stroke-linecap="round" stroke-linejoin="round" d="M19 9l-7 7-7-7" /></svg>
-      </button>
-      <div id="admin_dropdown" class="dropdown-content">
-        <a href="javascript:void(0)" onclick="openCredentialsModal()">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" /></svg>
-          网页安全
-        </a>
-        <a href="javascript:void(0)" onclick="openNetworkModal()">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" /><path stroke-linecap="round" stroke-linejoin="round" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
-          代理设置
-        </a>
-        <a href="javascript:void(0)" onclick="openGatewayModal()">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>
-          网关设置
-        </a>
-        <a href="javascript:void(0)" onclick="openLogsModal()">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" /></svg>
-          日志
-        </a>
-        <a href="javascript:void(0)" onclick="logoutAdmin()" style="color: var(--danger); border-top: 1px solid rgba(255,255,255,0.05);">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:14px; height:14px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1" /></svg>
-          退出
-        </a>
+  <div class="topbar">
+    <div class="brand"><svg aria-hidden="true" xmlns="http://www.w3.org/2000/svg" style="width:24px; height:24px; color:#818cf8;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m5.618-4.016A11.955 11.955 0 0112 2.944a11.955 11.955 0 01-8.618 3.04A12.02 12.02 0 003 9c0 5.591 3.824 10.29 9 11.622 5.176-1.332 9-6.03 9-11.622 0-1.042-.133-2.052-.382-3.016z" /></svg><h1>AimiliVPN</h1><span>节点面板</span></div>
+    <div class="dropdown" id="admin_menu">
+      <button id="admin_btn" type="button" aria-expanded="false" aria-controls="admin_dropdown">管理 <span aria-hidden="true">⌄</span></button>
+      <div id="admin_dropdown" class="dropdown-content" hidden>
+        <button type="button" onclick="openNetworkModal()">代理与路由</button>
+        <button type="button" onclick="openScopeModal()">订阅范围</button>
+        <button type="button" onclick="openGatewayModal()">网关自检</button>
+        <button type="button" onclick="openLogsModal()">运行日志</button>
+        <button type="button" onclick="openCredentialsModal()">登录与安全</button>
+        <button type="button" onclick="showModal('about_modal')">版本与帮助</button>
+        <button type="button" onclick="logoutAdmin()">退出登录</button>
       </div>
     </div>
   </div>
 </header>
 <main>
-  
-    <!-- 当前连接活动节点卡片 -->
-    <section class="active-node-section" id="active_node_card" style="margin-bottom: 24px;">
-      <!-- Rendered dynamically by render() -->
-    </section>
-
-
-
-  <div id="scan_summary" style="display:flex; flex-wrap:wrap; align-items:center; gap:12px; margin:0 0 12px; color:var(--text-secondary); font-size:13px">
-    <label for="scan_progress" id="scan_label">正在获取节点</label>
-    <progress id="scan_progress" aria-label="本轮节点检测进度" style="inline-size:9rem; accent-color:var(--primary)"></progress>
-  </div>
-  <section class="toolbar">
-    <select id="status_filter">
-      <option value="all">全部节点</option>
-      <option value="available">可用节点</option>
-      <option value="testing">检测中</option>
-      <option value="unavailable">失效节点</option>
-    </select>
+  <section class="connection" id="active_node_card" aria-labelledby="connection_label">
+    <div class="connection-state"><span class="eyebrow" id="connection_label">代理状态</span><h2 id="connection_status" role="status">正在读取</h2></div>
+    <div class="connection-field"><span class="eyebrow">当前节点</span><span class="connection-value" id="connection_node">—</span></div>
+    <div class="connection-field"><span class="eyebrow">服务器本机代理</span><code class="connection-value address" id="local_proxy">—</code></div>
+    <button class="quiet" id="disconnect_btn" type="button" onclick="disconnectNode()" hidden>断开连接</button>
+    <p class="connection-note" id="connection_note" hidden></p>
+  </section>
+  <section class="node-panel" aria-labelledby="node_list_heading">
+    <div class="node-head">
+      <h2 id="node_list_heading" tabindex="-1">节点列表<span class="node-count" id="node_count"></span></h2>
+      <button id="filters_btn" type="button" aria-expanded="false" aria-controls="list_filters">筛选</button>
+      <button class="quiet" id="refresh" type="button">更新节点</button>
+    </div>
+    <div class="scan">
+      <label for="scan_progress" id="scan_label">正在读取节点</label>
+      <progress id="scan_progress" aria-label="本轮节点检测进度" hidden></progress>
+      <p id="scan_note" hidden></p>
+    </div>
+    <div class="toolbar" id="list_filters" role="group" aria-label="筛选当前列表" hidden>
     <div class="country-filter" id="country_filter">
       <button
         id="country_filter_button"
@@ -4102,81 +3621,45 @@ INDEX_HTML = r"""<!doctype html>
       <div id="country_filter_panel" class="country-filter-panel" role="group" aria-label="国家筛选" hidden>
         <div id="country_filter_options" class="country-filter-options"></div>
         <div class="country-filter-footer">
-          <button class="country-filter-clear" type="button" onclick="clearDiscoveryCountries(event)">清空选择</button>
+          <button class="country-filter-clear" type="button" onclick="clearCountryFilter(event)">清空选择</button>
         </div>
       </div>
     </div>
-    <select id="ip_type_filter">
-      <option value="">所有IP类型</option>
-      <option value="residential">住宅IP</option>
-      <option value="hosting">机房IP</option>
-    </select>
-    <button id="btn_favorites" class="toolbar-btn" type="button" onclick="toggleFavoritesView()" style="margin-left: auto; height: 42px; gap: 6px;">
-      <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2">
-        <path stroke-linecap="round" stroke-linejoin="round" d="M11.049 2.927c.3-.921 1.603-.921 1.902 0l1.519 4.674a1 1 0 00.95.69h4.907c.961 0 1.371 1.24.588 1.81l-3.97 2.883a1 1 0 00-.364 1.118l1.518 4.674c.3.922-.755 1.688-1.538 1.118l-3.971-2.883a1 1 0 00-1.175 0l-3.97 2.883c-.783.57-1.838-.197-1.538-1.118l1.518-4.674a1 1 0 00-.364-1.118l-3.97-2.883c-.783-.57-.372-1.81.588-1.81h4.906a1 1 0 00.951-.69l1.519-4.674z" />
-      </svg>
-      收藏菜单
-    </button>
+      <select id="status_filter" aria-label="节点状态">
+        <option value="all">全部状态</option><option value="available">可用</option><option value="testing">检测中</option><option value="not_checked">待检测</option><option value="unavailable">不可用</option>
+      </select>
+      <select id="ip_type_filter" aria-label="IP 类型"><option value="">全部 IP 类型</option><option value="residential">住宅 IP</option><option value="hosting">机房 IP</option></select>
+      <label class="filter-check"><input id="favorites_only" type="checkbox">只看收藏</label>
+      <button id="clear_filters" type="button" class="quiet" hidden>清除筛选</button>
+    </div>
+    <table class="node-table">
+      <caption class="sr-only">节点列表，选择节点名称可查看详情</caption>
+      <colgroup><col class="node-col"><col class="state-col"><col class="latency-col"><col></colgroup>
+      <thead><tr><th scope="col">国家 / 节点</th><th scope="col">状态</th><th scope="col">延迟</th><th scope="col">操作</th></tr></thead>
+      <tbody id="rows"><tr><td colspan="4" class="empty-row">正在读取节点…</td></tr></tbody>
+    </table>
+    <div id="pagination_container" class="pagination-container" hidden>
+      <span id="page_range"></span>
+      <div class="page-buttons"><button id="btn_first_page" type="button">首页</button><button id="btn_prev_page" type="button">上一页</button><span id="page_number"></span><button id="btn_next_page" type="button">下一页</button><button id="btn_last_page" type="button">尾页</button></div>
+    </div>
   </section>
-  <div id="favorites_panel" style="display: none; background: rgba(22, 30, 49, 0.97); border: 1px solid var(--border-color); border-radius: 16px; padding: 20px; margin-bottom: 20px; animation: modalFadeIn 0.25s ease-out;">
-    <div style="display: flex; flex-direction: column; gap: 16px;">
-      <div style="display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 16px;">
-        <div style="display: flex; flex-direction: column; gap: 4px;">
-          <span style="font-size: 15px; font-weight: 600; color: var(--text-primary); display: flex; align-items: center; gap: 6px;">
-            ⭐ 收藏专属管理面板
-          </span>
-          <span style="font-size: 13px; color: var(--text-secondary);">
-            在这里管理您的收藏节点过滤，以及设置出站连接漂移策略。
-          </span>
-        </div>
-        <div style="display: flex; gap: 12px; align-items: center;">
-          <button id="btn_toggle_fav_routing" type="button" class="toolbar-btn" style="height: 36px; padding: 0 14px; font-size: 13px; border-radius: 6px;" onclick="toggleFavRouting()">
-            启用仅用收藏出站
-          </button>
-        </div>
-      </div>
-      
-      <div style="border-top: 1px solid rgba(255,255,255,0.06); padding-top: 16px;">
-        <div style="padding: 10px 14px; background: rgba(245, 158, 11, 0.1); border: 1px solid rgba(245, 158, 11, 0.25); border-radius: 8px; font-size: 12px; color: var(--warning); line-height: 1.5;">
-          <strong>仅用收藏是强锁定模式。</strong>开启后只会连接收藏节点；如果收藏节点全部不可用，系统不会切换到非收藏节点。
-        </div>
-      </div>
+
+  <div id="node_modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="node_modal_title" aria-hidden="true">
+    <div class="modal-content" tabindex="-1">
+      <div class="dialog-head"><h3 id="node_modal_title">节点详情</h3><button type="button" onclick="hideModal('node_modal')">关闭</button></div>
+      <dl id="node_detail" class="detail-list"></dl>
+      <div class="dialog-actions"><button id="detail_favorite" type="button">收藏</button><button id="detail_test" type="button">复测节点</button></div>
     </div>
   </div>
-
-  <div class="table-wrapper">
-    <div class="table-container">
-      <table>
-        <thead>
-          <tr>
-            <th style="width: 90px;">状态</th>
-            <th style="width: 220px;">IP 地址 : 端口</th>
-            <th style="width: 125px;">延迟</th>
-            <th>物理位置</th>
-            <th>运营主体 / ISP</th>
-            <th style="width: 110px;">IP 类型</th>
-            <th style="width: 230px;">操作</th>
-          </tr>
-        </thead>
-        <tbody id="rows"></tbody>
-      </table>
-    </div>
-    
-    <!-- 分页控制栏 -->
-    <div id="pagination_container" class="pagination-container" style="padding: 16px; display: none; justify-content: space-between; align-items: center; border-top: 1px solid var(--border-color); flex-wrap: wrap; gap: 12px;">
-      <div style="font-size: 13px; color: var(--text-secondary);">
-        显示第 <span id="page_start" style="color: var(--text-primary); font-weight:600;">0</span> - <span id="page_end" style="color: var(--text-primary); font-weight:600;">0</span> 条，共 <span id="filtered_count" style="color: var(--text-primary); font-weight:600;">0</span> 条备选节点
-      </div>
-      <div style="display: flex; gap: 8px; align-items: center;">
-        <button id="btn_first_page" class="connect-btn" style="height: 32px; padding: 0 10px;">首页</button>
-        <button id="btn_prev_page" class="connect-btn" style="height: 32px; padding: 0 10px;">上一页</button>
-        <span style="font-size: 13px; color: var(--text-secondary); margin: 0 8px;">
-          页码 <strong id="current_page_val" style="color: var(--primary);">1</strong> / <strong id="total_pages_val">1</strong>
-        </span>
-        <button id="btn_next_page" class="connect-btn" style="height: 32px; padding: 0 10px;">下一页</button>
-        <button id="btn_last_page" class="connect-btn" style="height: 32px; padding: 0 10px;">尾页</button>
-      </div>
-    </div>
+  <div id="scope_modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="scope_title" aria-hidden="true">
+    <form class="modal-content" id="scope_form" tabindex="-1">
+      <div class="dialog-head"><h3 id="scope_title">订阅范围</h3><button type="button" onclick="hideModal('scope_modal')">关闭</button></div>
+      <p id="scope_hint">留空获取所有国家。要限制后台获取的节点，请填写国家代码，例如 JP, KR。</p>
+      <label class="form-label" for="scope_codes">订阅国家代码</label>
+      <input class="input-field" id="scope_codes" aria-describedby="scope_hint" autocomplete="off" spellcheck="false">
+      <p id="scope_feedback" role="status"></p>
+      <div class="dialog-actions"><button class="btn-primary" id="scope_save" type="submit">保存并更新节点</button></div>
+    </form>
   </div>
 
   <!-- Credentials Modal (网页安全设置) -->
@@ -4255,6 +3738,9 @@ INDEX_HTML = r"""<!doctype html>
                 <div class="option-card-title">自动配置</div>
                 <div class="option-card-desc">智能切换，最稳定</div>
               </button>
+              <button type="button" class="option-card" data-value="favorites" aria-pressed="false" onclick="setRoutingMode('favorites')">
+                <div class="option-card-title">仅用收藏</div><div class="option-card-desc">只连接已收藏的节点</div>
+              </button>
               <button type="button" class="option-card" data-value="fixed_ip" aria-pressed="false" onclick="setRoutingMode('fixed_ip')">
                 <div class="option-card-title">固定 IP</div>
                 <div class="option-card-desc">锁定IP，不自动切换</div>
@@ -4306,19 +3792,18 @@ INDEX_HTML = r"""<!doctype html>
   </div>
 
 
-  <!-- VPS 购买推荐 Modal -->
-  <div id="vps_recommend_modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="vps_modal_title" aria-hidden="true">
-    <div class="modal-content" tabindex="-1" style="max-width: 640px;">
-      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 24px;">
-        <h3 id="vps_modal_title" style="margin: 0; font-size: 18px; font-weight: 700; color: var(--text-primary); display: flex; align-items: center; gap: 8px;">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:20px; height:20px; color: var(--warning);" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9.663 17h4.673M12 3v1m6.364.364l-.707.707M21 12h-1M4 12H3m3.343-5.657l-.707-.707m2.828 9.9a5 5 0 117.072 0l-.548.547A3.374 3.374 0 0014 18.469V19a2 2 0 11-4 0v-.531c0-.895-.356-1.754-.988-2.386l-.548-.547z" /></svg>
-          VPS 购买推荐
-        </h3>
-        <button type="button" aria-label="关闭 VPS 推荐" onclick="closeVpsModal()" style="background: transparent; border: none; padding: 4px; cursor: pointer; color: var(--text-secondary); width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; border-radius: 50%;" onmouseover="this.style.background='rgba(255,255,255,0.05)'" onmouseout="this.style.background='transparent'">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:18px; height:18px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5"><path stroke-linecap="round" stroke-linejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
-        </button>
+  <div id="about_modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="about_title" aria-hidden="true">
+    <div class="modal-content" tabindex="-1">
+      <div class="dialog-head"><h3 id="about_title">版本与帮助</h3><button type="button" onclick="hideModal('about_modal')">关闭</button></div>
+      <div class="version-current"><strong id="current_version_label">AimiliVPN</strong><div id="deployment_mode_label" class="version-current-meta"></div></div>
+      <button id="check_update_btn" type="button" onclick="checkForUpdate(event)">检测更新</button>
+      <div id="update_check_status" class="update-check-status" role="status" hidden></div>
+      <div class="about-links">
+        <a href="https://github.com/OpenMili/aimili-vpngate/tree/main" target="_blank" rel="noopener noreferrer">项目源码</a>
+        <a id="latest_release_link" href="https://github.com/OpenMili/aimili-vpngate/releases/latest" target="_blank" rel="noopener noreferrer">正式版下载</a>
+        <a href="https://t.me/arestemple" target="_blank" rel="noopener noreferrer">Telegram</a>
       </div>
-      
+      <details class="project-links"><summary>项目支持与 VPS 推荐</summary>
       <div class="vps-links">
         <div class="vps-item">
           <span class="vps-tag tag-normal">RNVPS (RackNerd) 推荐</span>
@@ -4346,10 +3831,9 @@ INDEX_HTML = r"""<!doctype html>
           <span style="color: var(--primary); font-weight: bold;">TRX (TRC20):</span> TSdzCW6JvsrqcppodYjhSrku4mYmDJ9pxf
         </div>
       </div>
+      </details>
     </div>
   </div>
-
-  <button type="button" class="vps-recommend-tab" onclick="openVpsModal()">VPS购买推荐</button>
 
   <!-- Gateway Modal (网关自检与代理测试) -->
   <div id="gateway_modal" class="modal" role="dialog" aria-modal="true" aria-labelledby="gateway_modal_title" aria-hidden="true">
@@ -4464,10 +3948,8 @@ const favoriteRequestIds = new Set();
 let disconnectInFlight = false;
 let currentPage = 1;
 const pageSize = 50;
-let currentPageNodes = [];
-let selectedDiscoveryCountries = new Set();
-let discoveryCountriesInitialized = false;
-let discoveryCountriesDirty = false;
+const listCountries = new Set();
+let detailNodeId = "";
 let countryFilterSignature = "";
 let lastNodesSnapshotSignature = "";
 
@@ -4504,13 +3986,16 @@ let previousBodyOverflow = "";
 function showModal(id, preferredFocusSelector) {
   const modal = $(id);
   if (!modal) return;
-  modalReturnFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  const trigger = document.activeElement;
+  modalReturnFocus = $("admin_menu").contains(trigger) ? $("admin_btn") : trigger;
+  setAdminMenu(false);
   previousBodyOverflow = document.body.style.overflow;
   activeModalId = id;
   modal.style.display = "flex";
   modal.setAttribute("aria-hidden", "false");
   document.body.style.overflow = "hidden";
   window.setTimeout(() => {
+    if (activeModalId !== id) return;
     const preferred = preferredFocusSelector ? modal.querySelector(preferredFocusSelector) : null;
     const first = preferred || modal.querySelector('button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])');
     const focusTarget = first || modal.querySelector(".modal-content");
@@ -4527,15 +4012,17 @@ function hideModal(id) {
     document.body.style.overflow = previousBodyOverflow;
     const returnTarget = modalReturnFocus;
     modalReturnFocus = null;
-    if (returnTarget && document.contains(returnTarget)) returnTarget.focus();
+    const target = returnTarget && returnTarget.isConnected && !returnTarget.disabled
+      ? returnTarget : $("node_list_heading");
+    target.focus({preventScroll: true});
   }
 }
 function closeActiveModal() {
   if (activeModalId === "credentials_modal") closeCredentialsModal();
   else if (activeModalId === "network_modal") closeNetworkModal();
-  else if (activeModalId === "vps_recommend_modal") closeVpsModal();
   else if (activeModalId === "gateway_modal") closeGatewayModal();
   else if (activeModalId === "logs_modal") closeLogsModal();
+  else if (activeModalId) hideModal(activeModalId);
 }
 document.querySelectorAll(".modal").forEach(modal => {
   modal.addEventListener("mousedown", event => {
@@ -4553,13 +4040,14 @@ document.addEventListener("keydown", event => {
   }
   if (event.key !== "Tab") return;
   const focusable = Array.from(modal.querySelectorAll('button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'));
-  if (!focusable.length) {
+  const visible = focusable.filter(el => el.getClientRects().length);
+  if (!visible.length) {
     event.preventDefault();
     modal.querySelector(".modal-content").focus();
     return;
   }
-  const first = focusable[0];
-  const last = focusable[focusable.length - 1];
+  const first = visible[0];
+  const last = visible[visible.length - 1];
   if (event.shiftKey && document.activeElement === first) {
     event.preventDefault();
     last.focus();
@@ -4578,21 +4066,17 @@ function setHtmlIfChanged(element, html) {
 function isPageVisible() {
   return typeof document.hidden !== "boolean" || !document.hidden;
 }
-const base=p=>(p||"").split(/[\\/]/).pop();
-function time(ts){return ts?new Date(ts*1000).toLocaleString():"从未"}
-function speed(v){return v?`${(v*8/1000/1000).toFixed(1)} Mbps`:"-"}
-
-const translateQuality = q => {
-  const dict = {"normal": "普通", "proxy": "代理", "datacenter": "数据中心", "mobile": "移动端"};
-  return dict[q] || q || "-";
-};
-
 const translateIpType = t => {
   const dict = {"residential": "住宅 IP", "hosting": "机房 IP", "mobile": "移动网", "unknown": "未知", "proxy": "代理 IP"};
   return dict[t] || t || "-";
 };
 
-const translateConfidence = value => ({high: "高", medium: "中", low: "低"}[value] || "未知");
+function ipTypeLabel(node) {
+  if (!node.ip_type) return "尚无结果";
+  if (node.ip_type === "unknown") return "未能确认";
+  if (node.ip_type === "residential") return "疑似住宅 IP";
+  return translateIpType(node.ip_type);
+}
 
 const translateCountry = c => {
   const dict = {
@@ -4697,26 +4181,14 @@ function nodeLatencyHtml(node) {
   return "-";
 }
 
-function syncDiscoveryCountriesFromState() {
-  if (discoveryCountriesInitialized && discoveryCountriesDirty) return;
-  const saved = Array.isArray(state.discovery_countries) ? state.discovery_countries : [];
-  selectedDiscoveryCountries = new Set(
-    saved
-      .map(code => String(code || "").trim().toUpperCase())
-      .filter(code => /^[A-Z]{2}$/.test(code))
-  );
-  discoveryCountriesInitialized = true;
-}
-
 function updateCountryFilterLabel() {
   const label = $("country_filter_label");
   if (!label) return;
-  const count = selectedDiscoveryCountries.size;
+  const count = listCountries.size;
   label.textContent = count ? `已选 ${count} 个国家` : "所有国家";
 }
 
 function updateCountryFilter() {
-  syncDiscoveryCountriesFromState();
   const countries = new Map();
   nodes.forEach(node => {
     if (!node) return;
@@ -4730,7 +4202,7 @@ function updateCountryFilter() {
     current.count += 1;
     countries.set(code, current);
   });
-  selectedDiscoveryCountries.forEach(code => {
+  listCountries.forEach(code => {
     if (!countries.has(code)) {
       countries.set(code, { code, name: code, count: 0 });
     }
@@ -4741,6 +4213,7 @@ function updateCountryFilter() {
   const signature = JSON.stringify(options);
   if (signature !== countryFilterSignature) {
     const container = $("country_filter_options");
+    const focusedCode = container.contains(document.activeElement) ? document.activeElement.value : null;
     container.innerHTML = options.length
       ? options.map(item => `
           <label class="country-option">
@@ -4748,8 +4221,8 @@ function updateCountryFilter() {
               class="country-option-input"
               type="checkbox"
               value="${esc(item.code)}"
-              ${selectedDiscoveryCountries.has(item.code) ? "checked" : ""}
-              onchange="toggleDiscoveryCountry(this)"
+              ${listCountries.has(item.code) ? "checked" : ""}
+              onchange="toggleListCountry(this)"
             >
             <span class="country-option-box" aria-hidden="true"></span>
             <span class="country-option-flag" aria-hidden="true">${esc(countryFlag(item.code))}</span>
@@ -4758,10 +4231,14 @@ function updateCountryFilter() {
           </label>
         `).join("")
       : '<div style="padding:12px; color:var(--text-secondary); font-size:13px;">暂无国家数据</div>';
+    if (focusedCode) {
+      const next = Array.from(container.querySelectorAll("input")).find(input => input.value === focusedCode);
+      (next || $("country_filter_button")).focus({preventScroll: true});
+    }
     countryFilterSignature = signature;
   }
   document.querySelectorAll(".country-option-input").forEach(input => {
-    input.checked = selectedDiscoveryCountries.has(input.value);
+    input.checked = listCountries.has(input.value);
   });
   updateCountryFilterLabel();
 }
@@ -4774,21 +4251,19 @@ function setCountryFilterOpen(open) {
   panel.hidden = !open;
 }
 
-function toggleDiscoveryCountry(input) {
+function toggleListCountry(input) {
   const code = String(input.value || "").trim().toUpperCase();
   if (!/^[A-Z]{2}$/.test(code)) return;
-  if (input.checked) selectedDiscoveryCountries.add(code);
-  else selectedDiscoveryCountries.delete(code);
-  discoveryCountriesDirty = true;
+  if (input.checked) listCountries.add(code);
+  else listCountries.delete(code);
   currentPage = 1;
   updateCountryFilterLabel();
   render();
 }
 
-function clearDiscoveryCountries(event) {
+function clearCountryFilter(event) {
   if (event) event.stopPropagation();
-  selectedDiscoveryCountries.clear();
-  discoveryCountriesDirty = true;
+  listCountries.clear();
   document.querySelectorAll(".country-option-input").forEach(input => {
     input.checked = false;
   });
@@ -4803,7 +4278,7 @@ function getFilteredNodes() {
   return nodes.filter(n => {
     if (!n) return false;
     const countryCode = String(n.country_short || "").trim().toUpperCase();
-    if (selectedDiscoveryCountries.size && !selectedDiscoveryCountries.has(countryCode)) {
+    if (listCountries.size && !listCountries.has(countryCode)) {
       return false;
     }
     if (selectedIpType) {
@@ -4817,130 +4292,91 @@ function getFilteredNodes() {
     if (selectedStatus === "available" && n.probe_status !== "available" && !n.active) {
       return false;
     }
-    if (selectedStatus === "testing" && n.probe_status !== "testing") {
+    if (["testing", "not_checked"].includes(selectedStatus) && (n.active || (n.probe_status || "not_checked") !== selectedStatus)) {
       return false;
     }
     if (selectedStatus === "unavailable" && (n.probe_status !== "unavailable" || n.active)) {
       return false;
     }
     const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
-    if (showFavoritesOnly && !favoriteIds.includes(n.id)) {
+    if ($("favorites_only").checked && !favoriteIds.includes(n.id)) {
       return false;
     }
     return true;
   });
 }
 
-function render(){
-  const versionLabel = state.app_version_label || "V2.1.8 正式版";
-  if ($("github_version_label")) $("github_version_label").textContent = versionLabel;
-  if ($("current_version_label")) $("current_version_label").textContent = versionLabel;
-  if ($("deployment_mode_label")) {
-    const modeLabel = state.deployment_mode_label || "Python 源码";
-    $("deployment_mode_label").textContent = `${modeLabel}部署 · 更新通道：main`;
-  }
+function nodeAddress(node) {
+  const host = node.ip || node.remote_host;
+  return host ? formatUrlHost(host) + (node.remote_port ? ":" + node.remote_port : "") : "—";
+}
 
-  const activeNode = nodes.find(n => n && n.active);
-  
-  // Render separated Active Node Card
-  const activeCardContainer = $("active_node_card");
-  let activeCardHtml = "";
-  if (!activeNode && (state.is_connecting || (state.connection_enabled !== false && ["fetching", "testing"].includes(state.scan_phase)))) {
-    const busyTitle = state.is_connecting ? "正在连接" : "正在寻找首个可用节点";
-    const busyLatency = state.is_connecting ? (state.active_node_latency || "正在连接…") : "后台检测中";
-    const busyMessage = state.is_connecting ? state.last_check_message : "检测通过后将自动连接。";
-    activeCardHtml = `
-      <div class="active-card" style="background: var(--bg-surface); border-color: var(--warning); box-shadow: 0 0 15px rgba(245, 158, 11, 0.15);">
-        <div class="active-card-info">
-          <div class="stat-icon-wrapper" style="background: rgba(245, 158, 11, 0.15); border-color: rgba(245, 158, 11, 0.3); width: 48px; height: 48px; border-radius: 12px;">
-            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" style="color: #f59e0b; width: 24px; height: 24px; animation: spin 2s linear infinite;"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18" /></svg>
-          </div>
-          <div class="active-card-details">
-            <div class="active-card-title" style="color: var(--text-primary);">
-              <span class="badge" style="background: rgba(245, 158, 11, 0.15); color: #f59e0b; border-color: rgba(245, 158, 11, 0.3);"><span class="badge-pulse" style="background: #f59e0b;"></span>${esc(busyTitle)}</span>
-              <strong>${esc(busyLatency)}</strong>
-            </div>
-            <div class="active-card-meta" style="margin-top: 4px;">
-              ${esc(busyMessage)}
-            </div>
-          </div>
-        </div>
-      </div>
-    `;
-  } else if (activeNode) {
-    const latencyText = nodeLatencyHtml(activeNode);
-    const displayLocation = activeNode.location || translateCountry(activeNode.country) || "-";
-    const declaredFlag = countryFlag(activeNode.country_short);
-    const locationFlag = countryFlag(activeNode.geo_country_short || activeNode.country_short);
-    const ipTypeTitle = `${translateIpType(activeNode.ip_type)} · 置信度：${translateConfidence(activeNode.ip_type_confidence)} · 来源：${(activeNode.ip_type_sources || []).join(" + ") || "未知"}`;
-    activeCardHtml = `
-      <div class="active-card">
-        <div class="active-card-info">
-          <div class="stat-icon-wrapper" style="background: rgba(16, 185, 129, 0.15); border-color: rgba(16, 185, 129, 0.3); width: 48px; height: 48px; border-radius: 12px;">
-            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" style="color: #34d399; width: 24px; height: 24px;"><path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" /></svg>
-          </div>
-          <div class="active-card-details">
-            <div class="active-card-title">
-              <span class="badge available"><span class="badge-pulse"></span>已连接</span>
-              <strong>${declaredFlag ? `${esc(declaredFlag)} ` : ""}${esc(translateCountry(activeNode.country))} 节点</strong>
-            </div>
-            <div class="active-card-value mono" style="font-size: 20px; margin-top: 2px;">
-              ${esc(activeNode.ip || activeNode.remote_host)}:${activeNode.remote_port || ""}
-            </div>
-            <div class="active-card-meta" style="margin-top: 4px;">
-              <span title="IP 情报源推测位置；节点申报国家见标题">物理位置: <strong>${locationFlag ? `${esc(locationFlag)} ` : ""}${esc(displayLocation)}</strong></span>
-              <span style="margin-left: 12px;">延时: <strong>${latencyText}</strong></span>
-              <span style="margin-left: 12px;">运营主体: <strong>${esc(activeNode.owner || activeNode.as_name || "-")}</strong></span>
-              <span style="margin-left: 12px;" title="${esc(ipTypeTitle)}">IP 类型: <strong>${esc(translateIpType(activeNode.ip_type))}</strong></span>
-            </div>
-          </div>
-        </div>
-        <button class="btn-danger" ${disconnectInFlight ? "disabled" : ""} style="height: 38px; padding: 0 16px; border-radius: 8px;" onclick="disconnectNode()">
-          <svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M10 14l2-2m0 0l2-2m-2 2l-2-2m2 2l2 2m7-2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg>
-          断开连接
-        </button>
-      </div>
-    `;
-  } else {
-    activeCardHtml = `
-      <div class="active-card" style="background: var(--bg-surface); border-color: var(--border-color); box-shadow: none;">
-        <div class="active-card-info">
-          <div class="stat-icon-wrapper" style="background: rgba(244, 63, 94, 0.1); border-color: rgba(244, 63, 94, 0.2); width: 48px; height: 48px; border-radius: 12px;">
-            <svg xmlns="http://www.w3.org/2000/svg" class="stat-icon" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5" style="color: var(--danger); width: 24px; height: 24px;"><path stroke-linecap="round" stroke-linejoin="round" d="M18.364 18.364A9 9 0 005.636 5.636m12.728 12.728A9 9 0 015.636 5.636m12.728 12.728L5.636 5.636" /></svg>
-          </div>
-          <div class="active-card-details">
-            <div class="active-card-title" style="color: var(--text-secondary);">
-              <span class="badge unavailable" style="padding: 2px 8px;">未连接</span> 当前未连接 VPN 节点
-            </div>
-            <div class="active-card-meta" style="margin-top: 4px;">
-              在下方列表中选择一个可用备用节点并点击 “切换” 按钮开始连接。
-            </div>
-          </div>
-        </div>
-      </div>
-    `;
-  }
-  setHtmlIfChanged(activeCardContainer, activeCardHtml);
+function setText(element, text) {
+  if (element.textContent !== text) element.textContent = text;
+}
 
-  const shown = getFilteredNodes();
-  
-  if ($("total")) $("total").textContent = nodes.length; 
+function renderConnection(activeNode) {
+  let title = "未连接", tone = "idle", note = "";
+  const tunnelNode = activeNode || nodes.find(n => n.id === state.active_openvpn_node_id);
+  if (state.is_connecting) {
+    title = "正在连接"; tone = "busy"; note = state.last_check_message || "正在验证节点出口。";
+  } else if (activeNode && state.proxy_ok) {
+    title = "代理可用"; tone = "ok";
+    if (state.proxy_ip && state.proxy_ip !== "-") {
+      const report = state.exit_ip_info?.ip === state.proxy_ip ? state.exit_ip_info : null;
+      const info = report ? [report.owner, report.asn, ipTypeLabel(report)].filter(Boolean) : [];
+      note = ["实际出口 IP " + state.proxy_ip, ...info].join(" · ");
+    }
+  } else if (state.active_openvpn_node_id && state.proxy_ok === false) {
+    title = "出口异常"; tone = "error"; note = state.proxy_error || "可在管理中的网关自检查看连通性。";
+  } else if (state.connection_enabled === false) {
+    title = "已断开"; note = "选择一个可用节点即可重新连接。";
+  } else if (["fetching", "testing"].includes(state.scan_phase)) {
+    title = "正在准备代理"; tone = "busy"; note = "首个节点通过检测后会自动连接。";
+  } else if (!nodes.some(node => node.probe_status === "available")) {
+    note = "等待可用节点。";
+  }
+  $("active_node_card").dataset.tone = tone;
+  setText($("connection_status"), title);
+  setText($("connection_node"), tunnelNode ? `${translateCountry(tunnelNode.country)} · ${nodeAddress(tunnelNode)}` : "—");
+  setText($("local_proxy"), state.local_proxy || "—");
+  $("disconnect_btn").hidden = !tunnelNode && !state.is_connecting;
+  $("disconnect_btn").disabled = disconnectInFlight;
+  setText($("connection_note"), note);
+  $("connection_note").hidden = !note;
+}
+
+function renderScan() {
   const available = nodes.filter(n => n.active || n.probe_status === "available").length;
   const failed = nodes.filter(n => !n.active && n.probe_status === "unavailable").length;
   const checked = available + failed;
-  const progress = $("scan_progress");
   const fetching = state.scan_phase === "fetching";
-  if (fetching || !nodes.length) progress.removeAttribute("value");
-  else { progress.max = nodes.length; progress.value = checked; }
-  progress.hidden = !nodes.length && !fetching;
-  $("scan_label").textContent = fetching ? "正在获取订阅节点" : `已检测 ${checked}/${nodes.length} · 可用 ${available} · 不可用 ${failed}`;
-  if ($("active")) $("active").textContent = activeNode ? 1 : 0; 
-  
-  const statusMessage = (state.is_connecting ? state.last_check_message : state.scan_message) || state.last_check_message || "";
-  const activeNodeInfo = activeNode ? `<span class="badge available" style="margin-left:8px; padding:2px 8px;">${esc(translateCountry(activeNode.country))} (${esc(activeNode.id)})</span>` : `<span class="badge unavailable" style="margin-left:8px; padding:2px 8px;">无</span>`;
-  const localProxy = state.local_proxy || `http://127.0.0.1:${state.proxy_port || 7928}`;
-  if ($("status")) { $("status").innerHTML=`<span class="status-dot"></span>HTTP 代理本地接口：${esc(localProxy)} | 活动节点：${activeNodeInfo} | 状态：${esc(statusMessage)}`; }
-  
+  const label = fetching ? "正在获取订阅节点…" : `已检测 ${checked}/${nodes.length} · 可用 ${available} · 不可用 ${failed}`;
+  setText($("scan_label"), label);
+  const progress = $("scan_progress");
+  progress.hidden = !fetching && (!nodes.length || checked === nodes.length);
+  if (fetching) progress.removeAttribute("value");
+  else { progress.max = nodes.length || 1; progress.value = checked; }
+  const messages = [];
+  if (["paused", "error", "empty"].includes(state.scan_phase) && state.scan_message) messages.push(state.scan_message);
+  if (state.discovery_countries?.length) messages.push(`订阅范围 ${state.discovery_countries.join("、")}（管理中可更改）`);
+  setText($("scan_note"), messages.join(" · "));
+  $("scan_note").hidden = !messages.length;
+}
+
+function render() {
+  const versionLabel = state.app_version_label || "AimiliVPN";
+  setText($("current_version_label"), versionLabel);
+  setText($("deployment_mode_label"), `${state.deployment_mode_label || "Python 源码"}部署 · 更新通道 main`);
+  renderConnection(nodes.find(n => n.active));
+  renderScan();
+  renderList();
+  if (activeModalId === "node_modal") renderNodeDetail();
+  renderGatewayProbe();
+}
+
+function renderGatewayProbe() {
+  if (gatewayProbeInFlight) return;
   // Update proxy test status card based on background checks
   const pBadge = $("proxy_status_badge");
   const pIpVal = $("proxy_ip_val");
@@ -4990,89 +4426,120 @@ function render(){
     }
   }
 
-  updateFavPanelUI();
-
-  // Pagination calculation
-  const totalPages = Math.ceil(shown.length / pageSize) || 1;
-  const paginationContainer = $("pagination_container");
-  if (paginationContainer) paginationContainer.style.display = totalPages > 1 ? "flex" : "none";
-  if (currentPage > totalPages) currentPage = totalPages;
-  if (currentPage < 1) currentPage = 1;
-  
-  const startIndex = (currentPage - 1) * pageSize;
-  const endIndex = Math.min(startIndex + pageSize, shown.length);
-  currentPageNodes = shown.slice(startIndex, endIndex);
-
-  // Render table rows
-  let rowsHtml = "";
-  if (currentPageNodes.length === 0) {
-    const emptyMessage = !nodes.length && fetching ? "正在获取订阅节点…" : "未找到符合过滤条件的节点。";
-    rowsHtml = `<tr><td colspan="7" style="text-align: center; color: var(--text-secondary); padding: 40px 0;">${emptyMessage}</td></tr>`;
-  } else {
-    rowsHtml = currentPageNodes.map(n=>{
-      if (!n) return '';
-      const isCurrentlyActive = activeNode && n.id === activeNode.id;
-      const isPending = Boolean(state.is_connecting && state.pending_node_id === n.id);
-      const rowClass = isCurrentlyActive ? 'class="active-row"' : '';
-      
-      const badgeClass = isCurrentlyActive ? 'available' : (isPending ? 'testing' : (n.probe_status || 'not_checked'));
-      const badgeText = isCurrentlyActive ? '<span class="badge-pulse"></span>已连接' : (isPending ? '<span class="badge-pulse"></span>切换中' : translateStatus(n.probe_status));
-      const latencyText = nodeLatencyHtml(n);
-      const displayLocation = n.location || translateCountry(n.country) || "-";
-      const flag = countryFlag(n.geo_country_short || n.country_short);
-      const locationTitle = n.location
-        ? `IP 推测位置：${displayLocation}；节点申报国家：${translateCountry(n.country)}`
-        : `节点申报国家：${translateCountry(n.country)}`;
-      const ipTypeTitle = `${translateIpType(n.ip_type)} · 置信度：${translateConfidence(n.ip_type_confidence)} · 来源：${(n.ip_type_sources || []).join(" + ") || "未知"}`;
-      
-      const isTesting = testingNodeIds.has(n.id) || n.probe_status === "testing";
-      const testSpinner = `<svg style="animation: spin 1s linear infinite; width: 12px; height: 12px; display: inline-block; margin-right: 4px; vertical-align: middle;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3"><circle cx="12" cy="12" r="10" stroke="currentColor" stroke-opacity="0.2" fill="none"></circle><path d="M4 12a8 8 0 018-8" stroke="currentColor" fill="none"></path></svg>`;
-      const testBtnText = isTesting ? `${testSpinner}检测中` : '检测';
-      const testBtn = `<button class="test-btn" data-node-id="${esc(n.id)}" ${(isTesting || state.maintenance_running || isCurrentlyActive || isPending) ? 'disabled' : ''} onclick="testNode(this, '${esc(n.id)}', event)">${testBtnText}</button>`;
-      
-      const canSwitch = n.probe_status === "available" && !isTesting && !state.is_connecting;
-      const connectBtn = isCurrentlyActive 
-        ? `<button class="connect-btn" disabled style="background: var(--success-gradient); color: white; cursor: default; opacity: 1;">已连接</button>`
-        : `<button class="connect-btn" ${!canSwitch ? 'disabled style="opacity:0.3; cursor:not-allowed;"' : ''} onclick="connectNode('${esc(n.id)}')">${isPending ? '切换中' : '切换'}</button>`;
-      
-      const favoriteIds = Array.isArray(state.favorite_node_ids) ? state.favorite_node_ids : [];
-      const isFav = favoriteIds.includes(n.id);
-      const favoriteBusy = favoriteRequestIds.has(n.id);
-      const favBtn = isFav 
-        ? `<button class="test-btn" ${favoriteBusy ? "disabled" : ""} style="color: var(--warning); border-color: rgba(245, 158, 11, 0.4); padding: 0 8px; height: 30px;" onclick="toggleFavorite('${esc(n.id)}', event)">${favoriteBusy ? "处理中" : "★ 已收藏"}</button>`
-        : `<button class="test-btn" ${favoriteBusy ? "disabled" : ""} style="color: var(--text-secondary); border-color: var(--border-color); padding: 0 8px; height: 30px;" onclick="toggleFavorite('${esc(n.id)}', event)">${favoriteBusy ? "处理中" : "☆ 收藏"}</button>`;
-
-      return `<tr ${rowClass}>
-        <td><span class="badge ${badgeClass}">${badgeText}</span></td>
-        <td class="mono" style="white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.ip||n.remote_host)}:${n.remote_port||""}">${esc(n.ip||n.remote_host)}:${n.remote_port||""}</td>
-        <td style="white-space: nowrap;">${latencyText}</td>
-        <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(locationTitle)}">${flag ? `<span aria-hidden="true">${esc(flag)}</span> ` : ""}${esc(displayLocation)}</td>
-        <td style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis;" title="${esc(n.owner||n.as_name||"-")}">${esc(n.owner||n.as_name||"-")}</td>
-        <td style="white-space: nowrap; max-width: 110px; overflow: hidden; text-overflow: ellipsis;" title="${esc(ipTypeTitle)}">${esc(translateIpType(n.ip_type))}</td>
-        <td>
-          <div class="table-actions">
-            ${testBtn}
-            ${favBtn}
-            ${connectBtn}
-          </div>
-        </td>
-      </tr>`;
-    }).join("");
-  }
-  setHtmlIfChanged($("rows"), rowsHtml);
-
-  // Render pagination controls
-  $("page_start").textContent = shown.length > 0 ? startIndex + 1 : 0;
-  $("page_end").textContent = endIndex;
-  $("filtered_count").textContent = shown.length;
-  $("current_page_val").textContent = currentPage;
-  $("total_pages_val").textContent = totalPages;
-  
-  $("btn_first_page").disabled = currentPage === 1;
-  $("btn_prev_page").disabled = currentPage === 1;
-  $("btn_next_page").disabled = currentPage === totalPages;
-  $("btn_last_page").disabled = currentPage === totalPages;
 }
+
+function createNodeRow(id) {
+  const row = document.createElement("tr");
+  row.dataset.nodeId = id;
+  row.innerHTML = `<td><button type="button" class="node-link" data-action="detail" aria-haspopup="dialog"><span class="node-name"></span><span class="node-address"></span></button></td>
+    <td><span class="badge"></span></td><td></td><td><button type="button" class="switch-btn" data-action="connect">切换</button><span class="current-marker" hidden>—</span></td>`;
+  return row;
+}
+
+function updateNodeRow(row, node) {
+  const pending = state.is_connecting && state.pending_node_id === node.id;
+  const testing = testingNodeIds.has(node.id) || node.probe_status === "testing";
+  const status = pending || testing ? "testing" : node.probe_status || "not_checked";
+  const country = translateCountry(node.country) || node.country_short;
+  const address = nodeAddress(node);
+  const detail = row.querySelector(".node-link");
+  const badge = row.querySelector(".badge");
+  const connect = row.querySelector(".switch-btn");
+  const name = (state.favorite_node_ids || []).includes(node.id) ? `${country} ★` : country;
+  setText(detail.firstElementChild, name);
+  setText(detail.lastElementChild, address);
+  detail.setAttribute("aria-label", `查看${country}节点 ${address} 的详情`);
+  row.classList.toggle("active-row", Boolean(node.active));
+  badge.className = "badge " + (node.active ? "available" : status);
+  setText(badge, node.active ? "已连接" : pending ? "切换中" : translateStatus(status));
+  setHtmlIfChanged(row.cells[2], nodeLatencyHtml(node));
+  connect.disabled = node.active || status !== "available" || state.is_connecting;
+  connect.hidden = Boolean(node.active);
+  connect.nextElementSibling.hidden = !node.active;
+  connect.setAttribute("aria-label", `切换到${country}节点 ${address}`);
+}
+
+// Keep button identity across snapshots so unrelated probe results do not interrupt keyboard use.
+function renderRows(page, emptyMessage) {
+  const body = $("rows");
+  const previous = new Map(Array.from(body.rows, row => [row.dataset.nodeId, row]));
+  const focused = body.contains(document.activeElement) ? document.activeElement : null;
+  const focusRow = focused?.closest("tr");
+  for (const [index, node] of page.entries()) {
+    const row = previous.get(node.id) || createNodeRow(node.id);
+    previous.delete(node.id);
+    updateNodeRow(row, node);
+    if (row !== body.rows[index]) body.insertBefore(row, body.rows[index] || null);
+  }
+  if (!page.length) {
+    const empty = previous.get(undefined) || body.insertRow();
+    previous.delete(undefined);
+    const cell = empty.cells[0] || empty.insertCell();
+    cell.colSpan = 4; cell.className = "empty-row";
+    setText(cell, emptyMessage);
+  }
+  previous.forEach(row => row.remove());
+  if (focused && (document.activeElement !== focused || focused.disabled || focused.hidden)) {
+    const fallback = focusRow?.isConnected ? focusRow.querySelector(".node-link") : $("node_list_heading");
+    (focused.isConnected && !focused.disabled && !focused.hidden ? focused : fallback).focus({preventScroll: true});
+  }
+}
+
+function renderList() {
+  const shown = getFilteredNodes();
+  const filterCount = Number(listCountries.size > 0) + Number($("status_filter").value !== "all")
+    + Number(Boolean($("ip_type_filter").value)) + Number($("favorites_only").checked);
+  setText($("filters_btn"), filterCount ? `筛选 (${filterCount})` : "筛选");
+  $("filters_btn").classList.toggle("has-filters", Boolean(filterCount));
+  $("clear_filters").hidden = !filterCount;
+  setText($("node_count"), filterCount ? `${shown.length} / ${nodes.length}` : String(nodes.length));
+  const totalPages = Math.ceil(shown.length / pageSize) || 1;
+  currentPage = Math.max(1, Math.min(currentPage, totalPages));
+  const start = (currentPage - 1) * pageSize;
+  const end = Math.min(start + pageSize, shown.length);
+  let empty = "暂无候选节点，可尝试更新节点。";
+  if (nodes.length) empty = "没有符合当前筛选的节点。";
+  else if (state.scan_phase === "fetching") empty = "正在获取订阅节点…";
+  renderRows(shown.slice(start, end), empty);
+  $("pagination_container").hidden = totalPages <= 1;
+  setText($("page_range"), `第 ${shown.length ? start + 1 : 0}–${end} 条，共 ${shown.length} 条`);
+  setText($("page_number"), `${currentPage} / ${totalPages}`);
+  $("btn_first_page").disabled = $("btn_prev_page").disabled = currentPage === 1;
+  $("btn_last_page").disabled = $("btn_next_page").disabled = currentPage === totalPages;
+}
+
+$("rows").addEventListener("click", event => {
+  const button = event.target.closest("button[data-action]");
+  if (!button || button.disabled) return;
+  const id = button.closest("tr").dataset.nodeId;
+  if (button.dataset.action === "connect") { connectNode(id); return; }
+  detailNodeId = id;
+  renderNodeDetail();
+  showModal("node_modal");
+});
+
+function renderNodeDetail() {
+  const n = nodes.find(node => node.id === detailNodeId);
+  const favorite = (state.favorite_node_ids || []).includes(detailNodeId);
+  const busy = testingNodeIds.has(detailNodeId) || n?.probe_status === "testing";
+  const facts = n ? [
+    ["节点申报国家", translateCountry(n.country)], ["节点入口", nodeAddress(n)],
+    ["状态", n.active ? "已连接" : translateStatus(busy ? "testing" : n.probe_status)],
+    ["本机实测", n.latency_ms > 0 ? `${n.latency_ms} ms` : "暂无"],
+    ["IP 位置", n.location], ["运营商", n.owner || n.as_name], ["ASN", n.asn], ["IP 类型", ipTypeLabel(n)],
+    ["查询来源", (n.ip_type_sources || []).join("、")],
+    ["查询说明", n.ip_type_reason === "last_known_metadata" ? "暂时无法查询，以上为上次的归属资料。" : ""],
+    ["检测结果", n.probe_message],
+  ] : [["状态", "节点已移出本轮订阅"]];
+  setHtmlIfChanged($("node_detail"), facts.filter(([, value]) => value && value !== "-").map(([key, value]) => `<dt>${esc(key)}</dt><dd>${esc(value)}</dd>`).join(""));
+  $("detail_favorite").disabled = !n || favoriteRequestIds.has(detailNodeId);
+  $("detail_favorite").setAttribute("aria-pressed", String(favorite));
+  setText($("detail_favorite"), favorite ? "取消收藏" : "收藏节点");
+  $("detail_test").disabled = !n || busy || n.active || state.maintenance_running || state.is_connecting;
+  setText($("detail_test"), busy ? "检测中…" : "复测节点");
+}
+$("detail_favorite").onclick = event => toggleFavorite(detailNodeId, event);
+$("detail_test").onclick = () => testNode(detailNodeId);
 
 // Hook up page buttons events
 $("btn_first_page").onclick = () => { currentPage = 1; render(); };
@@ -5089,8 +4556,7 @@ $("btn_last_page").onclick = () => {
   render();
 };
 
-async function testNode(btn, id, event){
-  if (event) event.stopPropagation();
+async function testNode(id) {
   if (testingNodeIds.has(id)) return;
   testingNodeIds.add(id);
   render();
@@ -5102,12 +4568,7 @@ async function testNode(btn, id, event){
       body: JSON.stringify({ id })
     }, 45000);
     const result = await readJsonResponse(response, "节点检测失败");
-    if (result.ok && result.node) {
-      const idx = nodes.findIndex(n => n && n.id === id);
-      if (idx !== -1) {
-        nodes[idx] = result.node;
-      }
-    }
+    if (result.ok && result.node) await load();
   } catch (e) {
     alert("节点检测失败: " + (e.message || "未知错误"));
   } finally {
@@ -5178,22 +4639,17 @@ function applyNodesSnapshot(data) {
   return true;
 }
 
-function refreshButtonBusy(message = "正在后台更新...") {
-  const btn = $("refresh");
-  if (!btn) return;
-  btn.disabled = true;
-  btn.innerHTML = `<svg style="animation: spin 1s linear infinite; width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>${esc(message)}`;
+function refreshButtonBusy(message = "正在更新…") {
+  $("refresh").disabled = true;
+  setText($("refresh"), message);
 }
-
 function refreshButtonIdle() {
-  const btn = $("refresh");
-  if (!btn) return;
-  btn.disabled = false;
-  btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M4 4v5h.582m15.356 2A8.001 8.001 0 1121.21 8H18.5" /></svg>更新节点`;
+  $("refresh").disabled = false;
+  setText($("refresh"), "更新节点");
 }
 
 async function connectNode(id){
-  if (state.is_connecting || !nodes.some(n => n.id === id && n.probe_status === "available" && !n.active)) return;
+  if (state.is_connecting || testingNodeIds.has(id) || !nodes.some(n => n.id === id && n.probe_status === "available" && !n.active)) return;
   state.is_connecting = true;
   state.pending_node_id = id;
   state.active_node_latency = "正在连接";
@@ -5238,10 +4694,7 @@ async function disconnectNode(){
     const response = await fetchWithTimeout("./api/disconnect", { method: "POST" }, 60000);
     const result = await readJsonResponse(response, "断开连接失败");
     if (result.ok) {
-      try {
-        await fetchWithTimeout("./api/test_proxy", { method: "POST" }, 45000);
-      } catch(pe){}
-      load();
+      await load();
     } else {
       alert("断开连接失败: " + (result.error || "未知错误"));
     }
@@ -5276,36 +4729,62 @@ document.addEventListener("keydown", event => {
     if (wasOpen) $("country_filter_button").focus();
   }
 });
-$("ip_type_filter").onchange=()=>{ currentPage = 1; render(); };
-$("status_filter").onchange=()=>{ currentPage = 1; render(); };
-
-$("refresh").onclick=async()=>{
-  refreshButtonBusy("正在启动更新...");
-  try{
-    const response = await fetchWithTimeout("./api/refresh_nodes",{
-      method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({
-        discovery_countries: Array.from(selectedDiscoveryCountries).sort()
-      })
-    }, 25000);
-    const result = await readJsonResponse(response, "节点更新启动失败");
-    if (!response.ok || !result.ok) {
-      throw new Error(result.error || "节点更新启动失败");
-    }
-    state.discovery_countries = Array.isArray(result.discovery_countries)
-      ? result.discovery_countries
-      : Array.from(selectedDiscoveryCountries);
-    discoveryCountriesDirty = false;
-    await load();
-    await load();
-  }
-  catch(e){
-    refreshButtonIdle();
-    alert("更新节点失败: " + (e.message || "未知错误"));
-  }
+for (const id of ["ip_type_filter", "status_filter", "favorites_only"]) {
+  $(id).onchange = () => { currentPage = 1; renderList(); };
+}
+$("filters_btn").onclick = () => {
+  const opening = $("list_filters").hidden;
+  $("list_filters").hidden = !opening;
+  $("filters_btn").setAttribute("aria-expanded", String(opening));
+  if (!opening) setCountryFilterOpen(false);
 };
+$("clear_filters").onclick = () => {
+  $("ip_type_filter").value = "";
+  $("status_filter").value = "all";
+  $("favorites_only").checked = false;
+  clearCountryFilter();
+  $("filters_btn").focus();
+};
+
+async function requestRefresh(payload) {
+  const response = await fetchWithTimeout("./api/refresh_nodes", {
+    method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(payload)
+  }, 25000);
+  const result = await readJsonResponse(response, "节点更新启动失败");
+  if (!result.ok) throw new Error(result.error || "节点更新启动失败");
+  return result;
+}
+$("refresh").onclick = async () => {
+  refreshButtonBusy();
+  try { await requestRefresh({}); await load(); }
+  catch (error) { alert("更新节点失败：" + error.message); }
+  finally { if (!state.maintenance_running) refreshButtonIdle(); }
+};
+function openScopeModal() {
+  $("scope_codes").value = (state.discovery_countries || []).join(", ");
+  $("scope_feedback").textContent = "";
+  showModal("scope_modal", "#scope_codes");
+}
+$("scope_form").onsubmit = async event => {
+  event.preventDefault();
+  const codes = [...new Set($("scope_codes").value.trim().toUpperCase().split(/[\s,，]+/).filter(Boolean))];
+  if (!codes.every(code => /^[A-Z]{2}$/.test(code))) {
+    $("scope_feedback").textContent = "每个国家代码都应为两个英文字母。";
+    $("scope_codes").focus();
+    return;
+  }
+  $("scope_save").disabled = true;
+  try {
+    const result = await requestRefresh({discovery_countries: codes});
+    $("scope_feedback").textContent = result.message || "已保存订阅范围。";
+    await load();
+  } catch (error) { $("scope_feedback").textContent = error.message; }
+  finally { $("scope_save").disabled = false; }
+};
+let gatewayProbeInFlight = false;
 $("btn_test_proxy").onclick = async () => {
+  if (gatewayProbeInFlight) return;
+  gatewayProbeInFlight = true;
   const btn = $("btn_test_proxy");
   const badge = $("proxy_status_badge");
   const ipVal = $("proxy_ip_val");
@@ -5340,16 +4819,11 @@ $("btn_test_proxy").onclick = async () => {
     ipVal.textContent = "-";
     latVal.innerHTML = `<span class="latency-val latency-poor" style="margin-left:8px; font-size:11px;">请求出错</span>`;
   } finally {
+    gatewayProbeInFlight = false;
     btn.disabled = false;
     btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" style="width:16px; height:16px;" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2"><path stroke-linecap="round" stroke-linejoin="round" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" /></svg> 测试代理`;
   }
 };
-
-// Admin dropdown toggle & GitHub dropdown toggle
-const adminBtn = $("admin_btn");
-const adminDropdown = $("admin_dropdown");
-const githubBtn = $("github_btn");
-const githubDropdown = $("github_dropdown");
 
 async function checkForUpdate(event) {
   if (event) event.stopPropagation();
@@ -5359,6 +4833,7 @@ async function checkForUpdate(event) {
   if (!button || !statusBox) return;
 
   button.disabled = true;
+  statusBox.hidden = false;
   statusBox.className = "update-check-status";
   statusBox.textContent = "正在连接 GitHub 检查最新正式版...";
   try {
@@ -5387,123 +4862,23 @@ async function checkForUpdate(event) {
   }
 }
 
-if (adminBtn && adminDropdown) {
-  adminBtn.onclick = (e) => {
-    e.stopPropagation();
-    const isShow = adminDropdown.style.display === "block";
-    adminDropdown.style.display = isShow ? "none" : "block";
-    adminBtn.setAttribute("aria-expanded", isShow ? "false" : "true");
-    if (githubDropdown) {
-      githubDropdown.style.display = "none";
-      if (githubBtn) githubBtn.setAttribute("aria-expanded", "false");
-    }
-  };
+function setAdminMenu(open) {
+  $("admin_dropdown").hidden = !open;
+  $("admin_btn").setAttribute("aria-expanded", String(open));
 }
-
-if (githubBtn && githubDropdown) {
-  githubBtn.onclick = (e) => {
-    e.stopPropagation();
-    const isShow = githubDropdown.style.display === "block";
-    githubDropdown.style.display = isShow ? "none" : "block";
-    githubBtn.setAttribute("aria-expanded", isShow ? "false" : "true");
-    if (adminDropdown) {
-      adminDropdown.style.display = "none";
-      if (adminBtn) adminBtn.setAttribute("aria-expanded", "false");
-    }
-  };
-  githubDropdown.onclick = event => event.stopPropagation();
-}
-
-document.addEventListener("click", () => {
-  if (adminDropdown) adminDropdown.style.display = "none";
-  if (githubDropdown) githubDropdown.style.display = "none";
-  if (adminBtn) adminBtn.setAttribute("aria-expanded", "false");
-  if (githubBtn) githubBtn.setAttribute("aria-expanded", "false");
+$("admin_btn").onclick = () => setAdminMenu($("admin_dropdown").hidden);
+$("admin_menu").addEventListener("focusout", event => {
+  if (!$("admin_menu").contains(event.relatedTarget)) setAdminMenu(false);
 });
-
+document.addEventListener("click", event => {
+  if (!$("admin_menu").contains(event.target)) setAdminMenu(false);
+});
 document.addEventListener("keydown", event => {
-  if (event.key !== "Escape") return;
-  const githubWasOpen = githubBtn && githubBtn.getAttribute("aria-expanded") === "true";
-  const adminWasOpen = adminBtn && adminBtn.getAttribute("aria-expanded") === "true";
-  if (adminDropdown) adminDropdown.style.display = "none";
-  if (githubDropdown) githubDropdown.style.display = "none";
-  if (adminBtn) adminBtn.setAttribute("aria-expanded", "false");
-  if (githubBtn) githubBtn.setAttribute("aria-expanded", "false");
-  if (githubWasOpen && githubBtn) githubBtn.focus();
-  else if (adminWasOpen && adminBtn) adminBtn.focus();
+  if (event.key === "Escape" && !$("admin_dropdown").hidden) {
+    setAdminMenu(false);
+    $("admin_btn").focus();
+  }
 });
-
-let showFavoritesOnly = false;
-
-function toggleFavoritesView() {
-  showFavoritesOnly = !showFavoritesOnly;
-  currentPage = 1;
-  render();
-}
-
-function updateFavPanelUI() {
-  const panel = $("favorites_panel");
-  if (!panel) return;
-  panel.style.display = showFavoritesOnly ? "block" : "none";
-  
-  const btn = $("btn_favorites");
-  if (btn) {
-    if (showFavoritesOnly) {
-      btn.classList.add("active");
-    } else {
-      btn.classList.remove("active");
-    }
-  }
-
-  if (showFavoritesOnly && state) {
-    const favRoutingBtn = $("btn_toggle_fav_routing");
-    if (favRoutingBtn) {
-      if (state.routing_mode === "favorites") {
-        favRoutingBtn.textContent = "禁用仅用收藏出站";
-        favRoutingBtn.style.background = "var(--danger-gradient)";
-        favRoutingBtn.style.borderColor = "transparent";
-        favRoutingBtn.style.color = "#ffffff";
-        favRoutingBtn.style.boxShadow = "0 0 12px rgba(244, 63, 94, 0.3)";
-      } else {
-        favRoutingBtn.textContent = "启用仅用收藏出站";
-        favRoutingBtn.style.background = "rgba(255,255,255,0.03)";
-        favRoutingBtn.style.borderColor = "var(--border-color)";
-        favRoutingBtn.style.color = "var(--text-primary)";
-        favRoutingBtn.style.boxShadow = "none";
-      }
-    }
-  }
-}
-
-async function toggleFavRouting() {
-  if (!state) return;
-  const newMode = state.routing_mode === "favorites" ? "auto" : "favorites";
-  
-  state.routing_mode = newMode;
-  updateFavPanelUI();
-  
-  try {
-    const res = await fetchWithTimeout("./api/update_routing", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        routing_mode: newMode,
-        force_country: state.force_country || "",
-        routing_ip_type: state.routing_ip_type || "all"
-      })
-    }, 25000);
-    const data = await readJsonResponse(res, "更新出站路由设置失败");
-    if (res.ok && data.ok) {
-      load();
-    } else {
-      alert("更新出站路由设置失败: " + (data.error || "未知错误"));
-      load();
-    }
-  } catch (err) {
-    alert("连接服务器失败，请稍后重试");
-    load();
-  }
-}
 
 function selectOptionCard(groupName, value) {
   if (groupName === 'routing_mode') {
@@ -5551,31 +4926,14 @@ function handleRoutingModeChange(mode) {
   const countryGroup = $("net_force_country_group");
   const warningDiv = $("net_routing_warning");
   
-  if (mode === "fixed_region") {
-    countryGroup.style.display = "block";
-    warningDiv.style.color = "var(--warning)";
-    warningDiv.style.background = "rgba(245, 158, 11, 0.1)";
-    warningDiv.style.border = "1px solid rgba(245, 158, 11, 0.2)";
-    warningDiv.innerHTML = `⚠️ <strong>固定地区</strong>：限制仅连接选定国家的节点，且后台仅并发测速该国家的节点。如果该国的所有可用节点都失效，会造成代理中断且<strong>绝不自动切换到其他国家</strong>的节点。`;
-  } else if (mode === "favorites") {
-    countryGroup.style.display = "none";
-    warningDiv.style.color = "var(--warning)";
-    warningDiv.style.background = "rgba(245, 158, 11, 0.1)";
-    warningDiv.style.border = "1px solid rgba(245, 158, 11, 0.2)";
-    warningDiv.innerHTML = `⚠️ <strong>仅用收藏</strong>：只连接和切换您收藏的节点。如果所有收藏的节点均失效，系统不会自动切换到未收藏的节点。请确保收藏列表中有足够多且可用的节点。`;
-  } else if (mode === "fixed_ip") {
-    countryGroup.style.display = "none";
-    warningDiv.style.color = "var(--warning)";
-    warningDiv.style.background = "rgba(245, 158, 11, 0.1)";
-    warningDiv.style.border = "1px solid rgba(245, 158, 11, 0.2)";
-    warningDiv.innerHTML = `⚠️ <strong>固定IP</strong>：锁定当前连接的节点。不管该节点是否失效，系统都绝不自动切换至其他IP；如果节点由于网络故障失效，会造成代理中断（但如果OpenVPN连接意外退出，脚本将尝试为您在后台重新拉起连接同一IP）。<br><strong>提示</strong>：您可以在主页节点列表中直接点击“连接”按钮来选择并锁定不同的IP节点。`;
-  } else {
-    countryGroup.style.display = "none";
-    warningDiv.style.color = "var(--text-secondary)";
-    warningDiv.style.background = "rgba(255, 255, 255, 0.02)";
-    warningDiv.style.border = "1px solid rgba(255, 255, 255, 0.05)";
-    warningDiv.innerHTML = `ℹ️ <strong>自动配置</strong>：全自动测试并选择最佳IP。在使用过程中，如果当前连接节点没有失效，将不再更换IP；如果当前节点失效，系统将立刻秒级自动漂移到其他最快的可用节点。`;
-  }
+  countryGroup.style.display = mode === "fixed_region" ? "block" : "none";
+  const explanations = {
+    auto: "当前节点失效时，自动连接其他可用节点。",
+    favorites: "只连接收藏的节点。所有收藏都不可用时，代理会中断。",
+    fixed_region: "只连接所选国家的节点。该国节点均不可用时，代理会中断。",
+    fixed_ip: "锁定当前节点。节点失效时会尝试重连同一节点。"
+  };
+  warningDiv.textContent = explanations[mode] || explanations.auto;
 }
 
 function populateRoutingCountries() {
@@ -5621,7 +4979,6 @@ function openCredentialsModal() {
     $("cred_suffix").value = state.secret_path || "";
   }
   showModal("credentials_modal", "#cred_username");
-  $("admin_dropdown").style.display = "none";
 }
 
 function closeCredentialsModal() {
@@ -5724,6 +5081,8 @@ function openNetworkModal() {
   $("network_error").style.display = "none";
   $("network_success").style.display = "none";
   $("network_form").reset();
+  $("network_submit_btn").disabled = false;
+  $("network_submit_btn").textContent = "保存修改";
   
   if (state) {
     $("net_proxy_port").value = state.proxy_port || 7928;
@@ -5736,7 +5095,6 @@ function openNetworkModal() {
   
   populateRoutingCountries();
   showModal("network_modal", "#net_proxy_port");
-  $("admin_dropdown").style.display = "none";
 }
 
 function closeNetworkModal() {
@@ -5830,14 +5188,6 @@ async function saveNetwork(e) {
 
 
 
-function openVpsModal() {
-  showModal("vps_recommend_modal");
-}
-
-function closeVpsModal() {
-  hideModal("vps_recommend_modal");
-}
-
 async function logoutAdmin() {
   try {
     const res = await fetchWithTimeout("./api/logout", { method: "POST" }, 20000);
@@ -5862,9 +5212,12 @@ async function watchNodes() {
   let delay = 150;
   try {
     const snapshot = await fetchNodesSnapshot(true);
-    applyNodesSnapshot(snapshot);
+    if (!applyNodesSnapshot(snapshot)) renderScan();
     if (!snapshotRevision) delay = 1000;
   } catch (error) {
+    setText($("scan_note"), "无法同步节点状态，正在重试…");
+    $("scan_note").hidden = false;
+    if (!snapshotRevision) setText($("connection_status"), "等待面板响应");
     delay = 2000;
   } finally {
     backgroundPollInFlight = false;
@@ -5877,7 +5230,6 @@ let gatewayPollInterval = null;
 let gatewayRequestInFlight = false;
 
 function openGatewayModal() {
-  $("admin_dropdown").style.display = "none";
   showModal("gateway_modal", "#btn_test_proxy");
   loadGatewayStatus();
   if (gatewayPollInterval) clearInterval(gatewayPollInterval);
@@ -5943,7 +5295,6 @@ let logsRequestInFlight = false;
 const MAX_RENDERED_LOG_LINES = 300;
 
 function openLogsModal() {
-  $("admin_dropdown").style.display = "none";
   showModal("logs_modal", "#log_filter_select");
   loadLogs();
   if (logsPollInterval) clearInterval(logsPollInterval);
@@ -6145,7 +5496,9 @@ def check_proxy_health() -> dict[str, Any]:
                         if len(time_info) == 2:
                             total_time_str, http_code = time_info
                             if http_code == "200":
-                                ip = str(ipaddress.ip_address(ip))
+                                ip = vpn_utils.public_ip(ip)
+                                if not ip:
+                                    continue
                                 latency_ms = int(float(total_time_str) * 1000)
                                 return {"ok": True, "ip": ip, "latency_ms": latency_ms}
             except FileNotFoundError:
@@ -6296,9 +5649,8 @@ def active_node_pinger() -> None:
                 if node:
                     ip = node.get("ip") or node.get("remote_host")
                     port = parse_int(node.get("remote_port"))
-                    fallback = parse_int(node.get("ping"))
                     if ip:
-                        latency = vpn_utils.ping_latency_ms(ip, port, fallback)
+                        latency = vpn_utils.ping_latency_ms(ip, port)
                         if latency > 0:
                             set_state(active_node_latency=f"{latency} ms")
                         else:
@@ -6500,17 +5852,17 @@ class Handler(BaseHTTPRequestHandler):
                     now = time.time()
                     if now - last_active_ping_time > 15.0:
                         last_active_ping_time = now
-                        def bg_ping(ip_addr: str, port: int, fallback: int) -> None:
+                        def bg_ping(ip_addr: str, port: int, node_id: str) -> None:
                             global last_active_latency
                             try:
-                                latency = vpn_utils.ping_latency_ms(ip_addr, port, fallback)
-                                if latency > 0:
+                                latency = vpn_utils.ping_latency_ms(ip_addr, port)
+                                if latency > 0 and active_openvpn_node_id == node_id:
                                     last_active_latency = latency
                             except Exception:
                                 pass
                         threading.Thread(
                             target=bg_ping, 
-                            args=(ip, parse_int(active_node.get("remote_port")), parse_int(active_node.get("ping"))),
+                            args=(ip, parse_int(active_node.get("remote_port")), current_active_id),
                             daemon=True
                         ).start()
                     if last_active_latency > 0:
@@ -7124,6 +6476,7 @@ class Tee:
 
 def request_service_stop(signum=None, frame=None) -> None:
     service_stopping.set()
+    ip_enrichment_wakeup.set()
     notify_node_changes()
     if service_http_server is not None:
         threading.Thread(target=service_http_server.shutdown, daemon=True).start()

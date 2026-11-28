@@ -99,6 +99,8 @@ class ManagerLogicTests(unittest.TestCase):
             mock.patch.object(manager.vpn_utils, "DATA_DIR", root),
             mock.patch.object(manager.vpn_utils, "IP_CACHE_FILE", root / "ip_cache.json"),
             mock.patch.dict(os.environ, {"VPNGATE_IP_BATCH_URL": "https://batch.example.test"}),
+            mock.patch.object(manager.vpn_utils, "provider_cooldowns", {}),
+            mock.patch.object(manager.vpn_utils, "asn_categories", {}),
             mock.patch.object(manager, "API_HTTP_URL", ""),
             mock.patch.object(manager, "MIRROR_HTTP_URL", ""),
             mock.patch.object(manager.vpn_utils, "diagnose_api_failure", return_value=(0, "offline fixture")),
@@ -204,7 +206,7 @@ class ManagerLogicTests(unittest.TestCase):
             {"proxy": True, "hosting": False, "mobile": False}
         )
 
-        self.assertEqual(("residential", "consumer_or_unclassified_network"), (residential, residential_reason))
+        self.assertEqual(("unknown", "network_type_unconfirmed"), (residential, residential_reason))
         self.assertEqual(("hosting", "proxy_provider_datacenter"), (softether, softether_reason))
         self.assertEqual(("hosting", "hosting_flag"), (hosting, hosting_reason))
         self.assertEqual(("mobile", "mobile_flag"), (mobile, mobile_reason))
@@ -247,7 +249,9 @@ class ManagerLogicTests(unittest.TestCase):
         response.__enter__.return_value = response
         node = {"id": "sony", "ip": ip}
 
-        with mock.patch.object(manager.vpn_utils.urllib.request, "urlopen", return_value=response) as urlopen_mock:
+        with (mock.patch.object(manager.vpn_utils.urllib.request, "urlopen", return_value=response) as urlopen_mock,
+              mock.patch.object(manager.vpn_utils, "query_public_ip", return_value={}),
+              mock.patch.object(manager.vpn_utils, "asn_category", return_value="isp")):
             manager.vpn_utils.enrich_ip_info([node])
 
         self.assertEqual("residential", node["ip_type"])
@@ -279,7 +283,7 @@ class ManagerLogicTests(unittest.TestCase):
         primary.read.return_value = json.dumps(primary_payload).encode("utf-8")
         primary.__enter__.return_value = primary
         secondary = mock.MagicMock()
-        secondary.read.return_value = json.dumps({"is_datacenter": True, "is_vpn": True}).encode("utf-8")
+        secondary.read.return_value = json.dumps({"ip": ip, "risk": {"is_datacenter": True, "is_vpn": True}}).encode("utf-8")
         secondary.__enter__.return_value = secondary
         node = {"id": "softether", "ip": ip}
 
@@ -294,11 +298,11 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual("high", node["ip_type_confidence"])
         self.assertEqual("datacenter", node["quality"])
         self.assertTrue(node["is_hosting"])
-        self.assertEqual(["ip-api.com", "ipapi.is"], node["ip_type_sources"])
+        self.assertEqual(["自定义批量接口", "ipquery.io"], node["ip_type_sources"])
         self.assertEqual("JP", node["geo_country_short"])
 
     def test_unverified_datacenter_conflict_becomes_unknown(self) -> None:
-        ip = "203.0.113.10"
+        ip = "9.9.9.9"
         primary_payload = [{
             "status": "success",
             "query": ip,
@@ -322,7 +326,7 @@ class ManagerLogicTests(unittest.TestCase):
         with mock.patch.object(
             manager.vpn_utils.urllib.request,
             "urlopen",
-            side_effect=[primary, TimeoutError("secondary unavailable")],
+            side_effect=[primary, TimeoutError("primary unavailable"), TimeoutError("secondary unavailable"), TimeoutError("ASN unavailable")],
         ):
             manager.vpn_utils.enrich_ip_info([node])
 
@@ -332,7 +336,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertEqual([], strict)
 
     def test_missing_provider_data_uses_secondary_source_or_stays_unknown(self) -> None:
-        ip = "203.0.113.11"
+        ip = "8.8.4.4"
         primary_payload = [{
             "status": "success",
             "query": ip,
@@ -356,7 +360,7 @@ class ManagerLogicTests(unittest.TestCase):
         with mock.patch.object(
             manager.vpn_utils.urllib.request,
             "urlopen",
-            side_effect=[primary, TimeoutError("secondary unavailable")],
+            side_effect=[primary, TimeoutError("primary unavailable"), TimeoutError("secondary unavailable"), TimeoutError("ASN unavailable")],
         ):
             manager.vpn_utils.enrich_ip_info([node])
 
@@ -368,6 +372,64 @@ class ManagerLogicTests(unittest.TestCase):
             {"routing_mode": "auto", "routing_ip_type": "residential"},
         )
         self.assertEqual([], strict)
+
+    def test_ipquery_live_schema_deduplication_and_cache(self) -> None:
+        ipv6 = "2606:4700:4700::1111"
+        payload = {"ip": ipv6, "isp": {"org": "Cloudflare", "asn": "AS13335"},
+                   "location": {"country_code": "US"}, "risk": {"is_datacenter": True}}
+        nodes = [{"ip": ipv6}, {"ip": "2606:4700:4700:0:0:0:0:1111"}, {"ip": "192.168.1.1"}]
+        with mock.patch.dict(os.environ, {"VPNGATE_IP_BATCH_URL": ""}), mock.patch.object(
+            manager.vpn_utils, "provider_json", return_value=payload
+        ) as provider:
+            manager.vpn_utils.enrich_ip_info(nodes)
+            manager.vpn_utils.enrich_ip_info(nodes)
+        provider.assert_called_once()
+        self.assertEqual(f"https://api.ipquery.io/{ipv6}?format=json", provider.call_args.args[0].full_url)
+        self.assertEqual(["hosting", "hosting", None], [n.get("ip_type") for n in nodes])
+        self.assertEqual("AS13335", nodes[1]["asn"])
+        self.assertEqual(["ipquery.io"], nodes[1]["ip_type_sources"])
+
+    def test_anonymous_flat_ipapi_and_public_asn_category(self) -> None:
+        ip = "82.66.115.249"
+        responses = [{"ip": "8.8.8.8", "isp": {"org": "Wrong address"}},
+                     {"ip": ip, "company": "Free SAS", "asn": "AS12322 Free SAS", "country": "France"},
+                     {"asn": 12322, "metadata": {"category": "isp"}}]
+        with mock.patch.dict(os.environ, {"VPNGATE_IP_BATCH_URL": ""}), mock.patch.object(
+            manager.vpn_utils, "provider_json", side_effect=responses
+        ) as provider:
+            node = {"ip": ip}
+            manager.vpn_utils.enrich_ip_info([node])
+        self.assertIn("/12322/aggregated.json", provider.call_args.args[0].full_url)
+        self.assertEqual(("Free SAS", "France", "residential", "medium"),
+                         (node["owner"], node["location"], node["ip_type"], node["ip_type_confidence"]))
+        self.assertEqual(["ipapi.is", "ipverse/as-ip-blocks"], node["ip_type_sources"])
+
+    def test_anonymous_api_respects_rate_limit_and_keeps_unknown(self) -> None:
+        utils = manager.vpn_utils
+        url = "https://api.ipapi.is/?q=8.8.8.8"
+        error = utils.urllib.error.HTTPError(url, 429, "limited", {"Retry-After": "600"}, None)
+        with mock.patch.object(utils.urllib.request, "urlopen", side_effect=error) as request:
+            for _ in range(2):
+                self.assertIsNone(utils.provider_json(utils.urllib.request.Request(url)))
+        request.assert_called_once()
+        report = utils.parse_ip_report("8.8.8.8", {"ip": "8.8.8.8", "company": "Example"}, "ipapi.is")
+        self.assertEqual("unknown", report["ip_type"])
+        self.assertEqual({}, utils.parse_ip_report("8.8.8.8", {"ip": "1.1.1.1", "company": "Other"}, "ipapi.is"))
+
+    def test_exit_metadata_is_bound_to_the_measured_ip(self) -> None:
+        manager.set_state(proxy_ok=True, proxy_ip="8.8.8.8")
+        def change_exit_while_looking_up(nodes):
+            self.assertEqual("8.8.8.8", nodes[0]["ip"])
+            nodes[0].update(owner="Google", ip_type="hosting")
+            manager.set_state(proxy_ok=True, proxy_ip="1.1.1.1")
+        with mock.patch.object(manager.vpn_utils, "enrich_ip_info", side_effect=change_exit_while_looking_up):
+            manager.enrich_stored_nodes()
+        self.assertNotIn("exit_ip_info", manager.get_state())
+        with mock.patch.object(manager.vpn_utils, "enrich_ip_info", side_effect=lambda rows: rows[0].update(owner="Cloudflare")):
+            manager.enrich_stored_nodes()
+        self.assertEqual("Cloudflare", manager.get_state()["exit_ip_info"]["owner"])
+        manager.set_state(proxy_ok=False)
+        self.assertNotIn("exit_ip_info", manager.get_state())
 
     def test_strict_residential_filter_requires_medium_or_high_confidence(self) -> None:
         nodes = [
@@ -767,10 +829,12 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn("保留 0 个", state["last_fetch_message"])
 
     def test_node_table_contains_latency_country_panel_and_test_action(self) -> None:
-        self.assertIn('<th style="width: 125px;">延迟</th>', manager.INDEX_HTML)
-        self.assertIn('colspan="7"', manager.INDEX_HTML)
+        self.assertIn('<th scope="col">延迟</th>', manager.INDEX_HTML)
+        self.assertIn('colspan="4"', manager.INDEX_HTML)
         self.assertIn('class="country-option-input"', manager.INDEX_HTML)
-        self.assertIn('${testBtn}', manager.INDEX_HTML)
+        self.assertIn('id="detail_test"', manager.INDEX_HTML)
+        self.assertIn('id="favorites_only"', manager.INDEX_HTML)
+        self.assertIn('await requestRefresh({})', manager.INDEX_HTML)
 
     def test_web_dashboard_has_browser_freeze_safeguards(self) -> None:
         self.assertNotIn("backdrop-filter", manager.LOGIN_HTML)
@@ -780,7 +844,7 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn("@media (prefers-reduced-motion: reduce)", manager.INDEX_HTML)
         self.assertIn("const pageSize = 50;", manager.INDEX_HTML)
         self.assertIn('id="pagination_container"', manager.INDEX_HTML)
-        self.assertIn('paginationContainer.style.display = totalPages > 1 ? "flex" : "none";', manager.INDEX_HTML)
+        self.assertIn('$("pagination_container").hidden = totalPages <= 1;', manager.INDEX_HTML)
         self.assertIn("const MAX_RENDERED_LOG_LINES = 300;", manager.INDEX_HTML)
         self.assertIn("nodesRequestPromise", manager.INDEX_HTML)
         self.assertIn("backgroundPollInFlight", manager.INDEX_HTML)
@@ -800,13 +864,11 @@ class ManagerLogicTests(unittest.TestCase):
         self.assertIn('role="dialog" aria-modal="true"', manager.INDEX_HTML)
         self.assertIn('aria-label="关闭网页安全设置"', manager.INDEX_HTML)
         self.assertIn('class="option-card active" data-value="auto" aria-pressed="true"', manager.INDEX_HTML)
-        self.assertIn('class="vps-recommend-tab"', manager.INDEX_HTML)
-        self.assertIn('position: static;', manager.INDEX_HTML)
-        self.assertIn('-webkit-overflow-scrolling: touch;', manager.INDEX_HTML)
+        self.assertNotIn('class="vps-recommend-tab"', manager.INDEX_HTML)
         self.assertIn('formatUrlHost(window.location.hostname)', manager.INDEX_HTML)
-        self.assertNotIn('id="status" class="status" style="display: none;"', manager.INDEX_HTML)
-        self.assertIn('${esc(localProxy)}', manager.INDEX_HTML)
-        self.assertIn('${esc(statusMessage)}', manager.INDEX_HTML)
+        self.assertIn('id="connection_status" role="status"', manager.INDEX_HTML)
+        self.assertIn('id="local_proxy"', manager.INDEX_HTML)
+        self.assertIn('id="node_list_heading"', manager.INDEX_HTML)
 
     def test_dashboard_javascript_is_valid(self) -> None:
         if not shutil.which("node"):

@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 import json
+import ipaddress
+from email.utils import parsedate_to_datetime
+import urllib.error
 import tempfile
 import os
 import re
@@ -19,11 +22,13 @@ DATA_DIR = Path(os.environ["VPNGATE_DATA_DIR"]).resolve() if os.environ.get("VPN
 from snapshot_utils import valid_remote_host
 
 IP_CACHE_FILE = DATA_DIR / "ip_cache.json"
-IP_CLASSIFICATION_VERSION = 4
+IP_CLASSIFICATION_VERSION = 5
 IP_CACHE_TTL_SECONDS = 7 * 24 * 3600
 
 ip_cache_lock = threading.RLock()
 enrichment_stop_event = threading.Event()
+provider_cooldowns: dict[str, float] = {}
+asn_categories: dict[str, tuple[str, float]] = {}
 physical_interface_lock = threading.Lock()
 physical_interface_cache: tuple[str | None, float] = (None, 0.0)
 
@@ -394,7 +399,8 @@ def load_ip_cache() -> dict[str, dict[str, Any]]:
     with ip_cache_lock:
         try:
             if IP_CACHE_FILE.exists():
-                return json.loads(IP_CACHE_FILE.read_text(encoding="utf-8"))
+                data = json.loads(IP_CACHE_FILE.read_text(encoding="utf-8"))
+                return data if isinstance(data, dict) else {}
         except Exception:
             pass
         return {}
@@ -436,37 +442,130 @@ def classify_ip_type(item: dict[str, Any]) -> tuple[str, str]:
     if item.get("proxy") and DATACENTER_PROVIDER_PATTERN.search(provider_text):
         return "hosting", "proxy_provider_datacenter"
 
-    # A residential volunteer running VPNGate is commonly marked as a proxy.
-    # Proxy use is retained in quality/is_proxy and must not change ownership.
-    return "residential", "consumer_or_unclassified_network"
+    # An ASN or provider name alone does not identify a household connection.
+    return "unknown", "network_type_unconfirmed"
 
 def classification_confidence(reason: str) -> str:
     if reason in {"mobile_flag", "hosting_flag", "secondary_datacenter", "secondary_mobile"}:
         return "high"
-    if reason in {"consumer_or_unclassified_network", "secondary_consumer_network"}:
+    if reason in {"asn_isp", "asn_hosting"}:
         return "medium"
     return "low"
 
-def query_secondary_ip_type(ip: str) -> dict[str, Any] | None:
-    if enrichment_stop_event.is_set():
-        return None
-    request = urllib.request.Request(
-        f"https://api.ipapi.is/?q={urllib.parse.quote(ip)}",
-        headers={"User-Agent": f"AimiliVPN-IP-Classifier/{IP_CLASSIFICATION_VERSION}"},
-    )
+def public_ip(value: Any) -> str:
+    if not isinstance(value, str) or "%" in value:
+        return ""
     try:
-        with urllib.request.urlopen(request, timeout=6) as response:
-            payload = json.loads(response.read().decode("utf-8", errors="replace"))
-        if (
-            not isinstance(payload, dict)
-            or payload.get("error")
-            or not any(key in payload for key in ("is_datacenter", "is_mobile"))
-        ):
+        address = ipaddress.ip_address(value.strip())
+    except ValueError:
+        return ""
+    return str(address) if address.is_global and not address.is_multicast else ""
+
+
+def provider_json(request: urllib.request.Request, limit: int = 65536) -> Any:
+    host = urllib.parse.urlsplit(request.full_url).hostname or ""
+    with ip_cache_lock:
+        if enrichment_stop_event.is_set() or provider_cooldowns.get(host, 0) > time.monotonic():
             return None
-        return payload
-    except Exception as exc:
-        print(f"[IP 类型] 第二情报源查询 {ip} 失败: {exc}", flush=True)
+    request.add_header("Accept", "application/json")
+    request.add_header("User-Agent", f"AimiliVPN-IP/{IP_CLASSIFICATION_VERSION}")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            raw = response.read(limit + 1)
+        return json.loads(raw) if len(raw) <= limit else None
+    except urllib.error.HTTPError as error:
+        delay = 0
+        if error.code == 429:
+            retry = str(error.headers.get("Retry-After", "")) if error.headers else ""
+            try:
+                delay = int(retry) if retry.isdecimal() else parsedate_to_datetime(retry).timestamp() - time.time()
+            except (ValueError, TypeError, OverflowError):
+                delay = 300
+            delay = max(60, delay)
+            if host == "api.ipapi.is":
+                # Anonymous quota resets at 00:00 UTC. Repeated over-quota requests can get the client blocked.
+                delay = max(delay, 86400 - time.time() % 86400)
+        elif error.code == 403:
+            delay = 86400
+        elif error.code >= 500:
+            delay = 30
+        error.close()
+    except OSError:
+        delay = 30
+    except (ValueError, RecursionError):
         return None
+    if delay:
+        with ip_cache_lock:
+            provider_cooldowns[host] = max(provider_cooldowns.get(host, 0), time.monotonic() + delay)
+    return None
+
+
+def asn_category(value: Any) -> str:
+    match = re.match(r"^(?:AS)?(\d{1,10})(?:\s|$)", str(value or ""), re.I)
+    if not match or not 0 < int(match[1]) <= 4294967295:
+        return ""
+    number = match[1]
+    with ip_cache_lock:
+        cached = asn_categories.get(number)
+        if cached and cached[1] > time.monotonic():
+            return cached[0]
+    url = f"https://raw.githubusercontent.com/ipverse/as-ip-blocks/master/as/{number}/aggregated.json"
+    data = provider_json(urllib.request.Request(url), 512 * 1024)
+    valid = isinstance(data, dict) and str(data.get("asn")) == number and isinstance(data.get("metadata"), dict)
+    category = str(data["metadata"].get("category") or "unclassified") if valid else ""
+    with ip_cache_lock:
+        if len(asn_categories) >= 2048:
+            asn_categories.pop(next(iter(asn_categories)))
+        asn_categories[number] = category, time.monotonic() + (IP_CACHE_TTL_SECONDS if valid else 300)
+    return category
+
+
+def parse_ip_report(ip: str, data: Any, source: str) -> dict[str, Any]:
+    if not isinstance(data, dict) or data.get("error") or data.get("is_bogon") is True or public_ip(data.get("ip")) != ip:
+        return {}
+    if source == "ipquery.io":
+        network = data.get("isp")
+        network = network if isinstance(network, dict) else {}
+        owner, asn = network.get("org") or network.get("isp"), network.get("asn")
+        risk, location = data.get("risk"), data.get("location")
+    else:
+        # ipapi.is serves flat company/ASN strings anonymously, and nested objects in its full format.
+        company, network = data.get("company"), data.get("asn")
+        owner = company.get("name") if isinstance(company, dict) else company
+        asn = network.get("asn") if isinstance(network, dict) else network
+        if not owner and isinstance(network, dict):
+            owner = network.get("org") or network.get("descr")
+        risk, location = data, data.get("location") or data
+    risk = risk if isinstance(risk, dict) else {}
+    location = location if isinstance(location, dict) else {}
+    place = [location.get("country"), location.get("state") or location.get("region"), location.get("city")]
+    place = " · ".join(dict.fromkeys(part for part in place if isinstance(part, str) and part))
+    if risk.get("is_mobile") is True:
+        kind, reason = "mobile", "secondary_mobile"
+    elif risk.get("is_datacenter") is True:
+        kind, reason = "hosting", "secondary_datacenter"
+    else:
+        kind, reason = "unknown", "network_type_unconfirmed"
+    owner = owner.strip() if isinstance(owner, str) else ""
+    asn = str(asn) if isinstance(asn, (str, int)) and not isinstance(asn, bool) else ""
+    country_code = str(location.get("country_code") or "").upper()
+    if not (owner or asn or place or country_code or kind != "unknown"):
+        return {}
+    proxy = any(risk.get(key) is True for key in ("is_proxy", "is_vpn", "is_tor"))
+    return dict(owner=owner or "", asn=str(asn or ""), location=place, geo_country_short=country_code,
+                ip_type=kind, ip_type_reason=reason, ip_type_confidence=classification_confidence(reason),
+                quality={"mobile": "mobile", "hosting": "datacenter"}.get(kind, "proxy" if proxy else "normal"),
+                is_proxy=proxy, is_mobile=kind == "mobile", is_hosting=kind == "hosting", ip_type_sources=[source])
+
+
+def query_public_ip(ip: str) -> dict[str, Any]:
+    for source, url in (("ipquery.io", f"https://api.ipquery.io/{ip}?format=json"),
+                        ("ipapi.is", f"https://api.ipapi.is/?q={ip}")):
+        result = parse_ip_report(ip, provider_json(urllib.request.Request(url)), source)
+        if result:
+            return result
+    return {}
+
 
 def apply_ip_cache_entry(node: dict[str, Any], entry: dict[str, Any]) -> None:
     for key in (
@@ -495,15 +594,16 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
     now = time.time()
 
     for node in nodes:
-        ip = node.get("ip") or node.get("remote_host")
+        ip = public_ip(node.get("ip") or node.get("remote_host"))
         if not ip:
             continue
         cache_entry = cache.get(ip) if isinstance(cache.get(ip), dict) else None
         if (
             cache_entry
             and cache_entry.get("classification_version") == IP_CLASSIFICATION_VERSION
-            and 0 <= now - cache_entry.get("cached_at", 0) < (
-                300 if cache_entry.get("ip_type") == "unknown" else IP_CACHE_TTL_SECONDS
+            and isinstance(cache_entry.get("cached_at"), (float, int))
+            and 0 <= now - cache_entry["cached_at"] < (
+                300 if cache_entry.get("retry_lookup") else IP_CACHE_TTL_SECONDS
             )
         ):
             cached = cache[ip]
@@ -519,8 +619,9 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
     new_entries = {}
     chunk_size = 100
     batch_url = os.environ.get("VPNGATE_IP_BATCH_URL", "").strip()
-    for i in range(0, len(ips_to_query) if batch_url.startswith("https://") else 0, chunk_size):
-        chunk = ips_to_query[i : i + chunk_size]
+    batch_ips = ips_to_query if batch_url.startswith("https://") else []
+    for i in range(0, len(batch_ips), chunk_size):
+        chunk = batch_ips[i : i + chunk_size]
         payload = json.dumps(chunk).encode("utf-8")
         request = urllib.request.Request(
             batch_url,
@@ -531,112 +632,83 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
             },
             method="POST",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=15) as response:
-                data = json.loads(response.read().decode("utf-8", errors="replace"))
-                if not isinstance(data, list):
-                    continue
-                for item in data:
-                    if not isinstance(item, dict):
-                        continue
-                    if item.get("status") != "success":
-                        continue
-                    query_ip = item.get("query")
-                    if query_ip not in chunk:
-                        continue
+        data = provider_json(request, 512 * 1024)
+        if not isinstance(data, list):
+            continue
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            if item.get("status") != "success":
+                continue
+            query_ip = public_ip(item.get("query"))
+            if query_ip not in chunk:
+                continue
 
-                    ip_type, ip_type_reason = classify_ip_type(item)
+            ip_type, ip_type_reason = classify_ip_type(item)
 
-                    quality = "normal"
-                    if item.get("mobile"):
-                        quality = "mobile"
-                    elif item.get("hosting"):
-                        quality = "datacenter"
-                    elif item.get("proxy"):
-                        quality = "proxy"
+            quality = "normal"
+            if item.get("mobile"):
+                quality = "mobile"
+            elif item.get("hosting"):
+                quality = "datacenter"
+            elif item.get("proxy"):
+                quality = "proxy"
 
-                    loc = " ".join(part for part in [item.get("country"), item.get("regionName"), item.get("city")] if part)
+            loc = " ".join(part for part in [item.get("country"), item.get("regionName"), item.get("city")] if part)
 
-                    new_entries[query_ip] = {
-                        "owner": item.get("org") or item.get("isp") or "",
-                        "asn": item.get("as") or "",
-                        "as_name": item.get("asname") or "",
-                        "location": loc,
-                        "geo_country_short": str(item.get("countryCode") or "").upper(),
-                        "ip_type": ip_type,
-                        "quality": quality,
-                        "is_proxy": bool(item.get("proxy")),
-                        "is_hosting": bool(item.get("hosting")),
-                        "is_mobile": bool(item.get("mobile")),
-                        "ip_type_reason": ip_type_reason,
-                        "ip_type_confidence": classification_confidence(ip_type_reason),
-                        "ip_type_sources": ["ip-api.com"],
-                        "classification_version": IP_CLASSIFICATION_VERSION,
-                        "cached_at": now,
-                    }
-        except Exception as e:
-            print(f"[enrich_ip_info] Query failed: {e}", flush=True)
-
-    for ip in ips_to_query:
-        new_entries.setdefault(ip, {
-            "ip_type": "unknown", "ip_type_reason": "missing_provider_data",
-            "ip_type_confidence": "low", "ip_type_sources": [],
-            "classification_version": IP_CLASSIFICATION_VERSION, "cached_at": now,
-        })
-    ambiguous_ips = [
-        ip
-        for ip, entry in new_entries.items()
-        if entry.get("ip_type_reason") in {"proxy_provider_datacenter", "missing_provider_data"}
-    ]
-    if ambiguous_ips:
-        max_workers = min(4, len(ambiguous_ips))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_map = {
-                executor.submit(query_secondary_ip_type, ip): ip
-                for ip in ambiguous_ips
+            new_entries[query_ip] = {
+                "owner": item.get("org") or item.get("isp") or "",
+                "asn": item.get("as") or "",
+                "as_name": item.get("asname") or "",
+                "location": loc,
+                "geo_country_short": str(item.get("countryCode") or "").upper(),
+                "ip_type": ip_type,
+                "quality": quality,
+                "is_proxy": bool(item.get("proxy")),
+                "is_hosting": bool(item.get("hosting")),
+                "is_mobile": bool(item.get("mobile")),
+                "ip_type_reason": ip_type_reason,
+                "ip_type_confidence": classification_confidence(ip_type_reason),
+                "ip_type_sources": ["自定义批量接口"],
+                "classification_version": IP_CLASSIFICATION_VERSION,
+                "cached_at": now,
             }
-            for future in concurrent.futures.as_completed(future_map):
-                ip = future_map[future]
-                try:
-                    secondary = future.result()
-                except Exception:
-                    secondary = None
-                entry = new_entries[ip]
-                if secondary is None:
-                    entry["ip_type"] = "unknown"
-                    entry["ip_type_reason"] = (
-                        "provider_data_unverified"
-                        if entry.get("ip_type_reason") == "missing_provider_data"
-                        else "datacenter_conflict_unverified"
-                    )
-                    entry["ip_type_confidence"] = "low"
-                    continue
-                entry["ip_type_sources"].append("ipapi.is")
-                if len(entry["ip_type_sources"]) == 1:
-                    company = secondary.get("company") or {}
-                    asn = secondary.get("asn") or {}
-                    location = secondary.get("location") or {}
-                    entry.update(
-                        owner=company.get("name", ""), asn=asn.get("asn", ""), as_name=asn.get("descr", ""),
-                        location=" ".join(str(location[key]) for key in ("country", "state", "city") if location.get(key)),
-                        geo_country_short=str(location.get("country_code") or "").upper(),
-                        is_proxy=bool(secondary.get("is_proxy") or secondary.get("is_vpn")),
-                        is_hosting=False, is_mobile=False, quality="normal",
-                    )
-                if secondary.get("is_mobile"):
-                    entry["ip_type"] = "mobile"
-                    entry["ip_type_reason"] = "secondary_mobile"
-                    entry["quality"] = "mobile"
-                    entry["is_mobile"] = True
-                elif secondary.get("is_datacenter"):
-                    entry["ip_type"] = "hosting"
-                    entry["ip_type_reason"] = "secondary_datacenter"
-                    entry["quality"] = "datacenter"
-                    entry["is_hosting"] = True
-                else:
-                    entry["ip_type"] = "residential"
-                    entry["ip_type_reason"] = "secondary_consumer_network"
-                entry["ip_type_confidence"] = classification_confidence(entry["ip_type_reason"])
+
+    unresolved = [ip for ip in ips_to_query if ip not in new_entries or
+                  new_entries[ip]["ip_type_reason"] in {"missing_provider_data", "proxy_provider_datacenter", "network_type_unconfirmed"}]
+    if unresolved:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(3, len(unresolved))) as pool:
+            for ip, report in zip(unresolved, pool.map(query_public_ip, unresolved)):
+                entry = new_entries.setdefault(ip, {})
+                conflict = entry.get("ip_type_reason") == "proxy_provider_datacenter"
+                if report:
+                    sources = entry.get("ip_type_sources", []) + report["ip_type_sources"]
+                    entry.update({key: value for key, value in report.items() if value != ""})
+                    entry["ip_type_sources"] = sources
+                if not report or (conflict and report["ip_type"] == "unknown"):
+                    reason = "datacenter_conflict_unverified" if conflict else "provider_data_unverified"
+                    entry.update(ip_type="unknown", ip_type_reason=reason, ip_type_confidence="low", retry_lookup=True)
+                if entry.get("ip_type") == "unknown" and entry.get("asn"):
+                    category = asn_category(entry["asn"])
+                    if category:
+                        entry.setdefault("ip_type_sources", []).append("ipverse/as-ip-blocks")
+                        if category == "hosting":
+                            entry.update(ip_type="hosting", ip_type_reason="asn_hosting", ip_type_confidence="medium",
+                                         is_hosting=True, quality="datacenter", retry_lookup=False)
+                        elif category == "isp" and not conflict:
+                            entry.update(ip_type="residential", ip_type_reason="asn_isp", ip_type_confidence="medium",
+                                         retry_lookup=False)
+                    else:
+                        entry["retry_lookup"] = True
+                if not report and not entry.get("owner"):
+                    prior = cache.get(ip)
+                    if isinstance(prior, dict) and prior.get("owner") and prior.get("ip_type_sources"):
+                        for field in ("owner", "asn", "as_name", "location", "geo_country_short", "ip_type_sources"):
+                            if prior.get(field):
+                                entry[field] = prior[field]
+                        entry["ip_type_reason"] = "last_known_metadata"
+                entry.setdefault("ip_type_sources", [])
+                entry.update(classification_version=IP_CLASSIFICATION_VERSION, cached_at=now)
 
     if not new_entries:
         return
@@ -649,7 +721,7 @@ def enrich_ip_info(nodes: list[dict[str, Any]]) -> None:
 
     # 4. Enrich nodes with newly queried info
     for node in nodes:
-        ip = node.get("ip") or node.get("remote_host")
+        ip = public_ip(node.get("ip") or node.get("remote_host"))
         if ip in new_entries:
             cached = new_entries[ip]
             apply_ip_cache_entry(node, cached)

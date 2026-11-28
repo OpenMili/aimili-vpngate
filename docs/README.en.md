@@ -146,6 +146,12 @@ docker compose up -d
 </details>
 
 <a id="connection"></a>
+## Node and exit IP details
+
+Select a node name to inspect its endpoint, latency, ISP and ASN. The connection summary shows the exit IP measured through the proxy. List filters affect this browser view. The Management menu contains subscription scope, routing settings and gateway diagnostics.
+
+The service looks up public IPs over HTTPS using IPQuery, with the anonymous ipapi.is response as a fallback. When the network type is unclear, it looks up the ASN category from ipverse on GitHub. An ISP classification is shown as likely residential. [IPQuery](https://ipquery.io/) · [ipapi.is anonymous format](https://ipapi.is/free-tier.html) · [ipverse/as-ip-blocks](https://github.com/ipverse/as-ip-blocks)
+
 ## Connection and Use
 
 ### 1. Sign in to the Web dashboard
